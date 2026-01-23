@@ -1,34 +1,41 @@
 import os
 import threading
-from telegram.ext import Updater, CommandHandler
-
-from fastapi import FastAPI
-import uvicorn
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+# --- Servidor dummy para Render ---
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
 
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+# --- Bot ---
 def start(update, context):
-    update.message.reply_text("👋 Ya quedó. Estoy vivo.")
+    update.message.reply_text("🤖 Bot activo. Manda una foto.")
 
-def run_bot():
+def photo_received(update, context):
+    update.message.reply_text("📸 Foto recibida.")
+
+def main():
     if not BOT_TOKEN:
-        raise ValueError("Falta BOT_TOKEN en Environment Variables")
+        raise RuntimeError("Falta BOT_TOKEN")
 
-    updater = Updater(token=BOT_TOKEN, use_context=True)
+    updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.photo, photo_received))
+
     updater.start_polling()
     updater.idle()
 
 if __name__ == "__main__":
-    # corre el bot en otro hilo
-    threading.Thread(target=run_bot, daemon=True).start()
-
-    # abre el puerto que Render necesita
-    port = int(os.environ.get("PORT", "10000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    threading.Thread(target=run_server, daemon=True).start()
+    main()
