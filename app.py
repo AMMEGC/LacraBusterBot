@@ -1,37 +1,22 @@
 import os
-import asyncio
-from fastapi import FastAPI
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-app = FastAPI()
-tg_app = None
+def start(update, context):
+    update.message.reply_text("👋 Ya quedó. Estoy vivo.")
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ya quedé prendido 😄")
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-@app.on_event("startup")
-async def startup_event():
-    global tg_app
+def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN en Render")
+        raise ValueError("Falta BOT_TOKEN en Environment Variables")
 
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start_cmd))
+    updater = Updater(token=BOT_TOKEN, use_context=True)
 
-    await tg_app.initialize()
-    await tg_app.start()
-    asyncio.create_task(tg_app.updater.start_polling())
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    if tg_app:
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
