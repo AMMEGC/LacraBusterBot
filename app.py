@@ -1,34 +1,37 @@
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
+import asyncio
+from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Mini servidor HTTP para que Render detecte un puerto
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"LacraBusterBot OK")
+app = FastAPI()
+tg_app = None
 
-def run_http():
-    port = int(os.environ.get("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ya quedé prendido 😄")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🟢 LacraBuster activo. Manda una foto o usa /alta")
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
-def main():
-    threading.Thread(target=run_http, daemon=True).start()
+@app.on_event("startup")
+async def startup_event():
+    global tg_app
+    if not BOT_TOKEN:
+        raise RuntimeError("Falta BOT_TOKEN en Render")
 
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.run_polling()
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start", start_cmd))
 
-if __name__ == "__main__":
-    main()
+    await tg_app.initialize()
+    await tg_app.start()
+    asyncio.create_task(tg_app.updater.start_polling())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if tg_app:
+        await tg_app.updater.stop()
+        await tg_app.stop()
+        await tg_app.shutdown()
