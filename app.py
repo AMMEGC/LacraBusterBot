@@ -131,6 +131,7 @@ def photo_received(update, context):
         return
 
     photo = message.photo[-1]  # mejor calidad
+    file_unique_id = photo.file_unique_id
     file = context.bot.get_file(photo.file_id)
     image_bytes = file.download_as_bytearray()
 
