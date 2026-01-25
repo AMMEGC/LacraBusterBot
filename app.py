@@ -12,6 +12,35 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 
+def ocr_space_extract_text(image_bytes: bytes) -> str:
+    if not OCR_SPACE_API_KEY:
+        return ""
+
+    url = "https://api.ocr.space/parse/image"
+    files = {"filename": ("image.jpg", image_bytes)}
+    data = {
+        "apikey": OCR_SPACE_API_KEY,
+        "language": "spa",
+        "isOverlayRequired": "false",
+        "OCREngine": "2",
+    }
+
+    try:
+        r = requests.post(url, files=files, data=data, timeout=60)
+        r.raise_for_status()
+        payload = r.json()
+
+        if payload.get("IsErroredOnProcessing"):
+            return ""
+
+        parsed = payload.get("ParsedResults", [])
+        if not parsed:
+            return ""
+
+        return (parsed[0].get("ParsedText") or "").strip()
+    except Exception:
+        return ""
+
 
 # --- Servidor dummy para Render (si lo sigues usando) ---
 class Handler(BaseHTTPRequestHandler):
@@ -96,32 +125,37 @@ def start(update, context):
 
 
 def photo_received(update, context):
-    try:
-        # foto más grande
-        photo = update.message.photo[-1]
-        file_unique_id = photo.file_unique_id
+    message = update.message
 
-        tg_file = photo.get_file()
-        image_bytes = tg_file.download_as_bytearray()
+    if not message.photo:
+        return
 
-        text = ocr_space_bytes(image_bytes)
+    photo = message.photo[-1]  # mejor calidad
+    file = context.bot.get_file(photo.file_id)
+    image_bytes = file.download_as_bytearray()
 
-        save_ocr(
-            chat_id=update.message.chat_id,
-            user_id=update.message.from_user.id,
-            message_id=update.message.message_id,
-            file_unique_id=file_unique_id,
-            ocr_text=text
-        )
+    text = ocr_space_extract_text(image_bytes)
 
-        preview = text[:300] + ("..." if len(text) > 300 else "")
-        if preview.strip():
-            update.message.reply_text("✅ OCR guardado en la base.\n\n🧾 Texto detectado:\n" + preview)
-        else:
-            update.message.reply_text("✅ OCR guardado en la base, pero no detecté texto legible en esta foto.")
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
 
-    except Exception as e:
-        update.message.reply_text(f"❌ Error OCR/DB: {e}")
+    cur.execute("""
+        INSERT INTO ocr_texts (chat_id, user_id, text, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        message.chat_id,
+        message.from_user.id,
+        text,
+        datetime.utcnow().isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+    if text.strip():
+        update.message.reply_text("📄 Texto detectado y guardado.")
+    else:
+        update.message.reply_text("📸 Foto guardada (sin texto legible).")
 
 
 def main():
