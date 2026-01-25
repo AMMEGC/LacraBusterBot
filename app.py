@@ -95,17 +95,18 @@ def ocr_space_bytes(image_bytes: bytes) -> str:
     url = "https://api.ocr.space/parse/image"
     files = {"file": ("image.jpg", image_bytes)}
     data = {
-        "apikey": OCR_SPACE_API_KEY,
-        "language": "spa",      # español :contentReference[oaicite:3]{index=3}
-        "isOverlayRequired": "false",
-        "OCREngine": "2",       # Engine 2 suele ir mejor en textos raros/rotados :contentReference[oaicite:4]{index=4}
-        "scale": "true",
-        "detectOrientation": "true",
-    }
+    "apikey": OCR_SPACE_API_KEY,
+    "language": "spa",
+    "OCREngine": "2",
+    "scale": "true",
+    "isTable": "true",
+}
+
 
     r = requests.post(url, files=files, data=data, timeout=60)
     r.raise_for_status()
     payload = r.json()
+print("OCR RAW RESULT:", payload)
 
     if payload.get("IsErroredOnProcessing"):
         msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Error OCR desconocido"
