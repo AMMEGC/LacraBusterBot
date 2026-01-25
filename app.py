@@ -79,9 +79,9 @@ def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text):
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO ocr_logs (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (chat_id, user_id, message_id, file_unique_id, datetime.utcnow().isoformat(), ocr_text))
+INSERT INTO ocr_texts (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
+VALUES (?, ?, ?, ?, ?, ?)
+""", (chat_id, user_id, message_id, file_unique_id, datetime.utcnow().isoformat(), ocr_text))
     conn.commit()
     conn.close()
 
@@ -140,14 +140,17 @@ def photo_received(update, context):
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO ocr_texts (chat_id, user_id, text, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (
-        message.chat_id,
-        message.from_user.id,
-        text,
-        datetime.utcnow().isoformat()
-    ))
+INSERT INTO ocr_texts (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
+VALUES (?, ?, ?, ?, ?, ?)
+""", (
+    message.chat_id,
+    message.from_user.id,
+    message.message_id,
+    file_unique_id,
+    datetime.utcnow().isoformat(),
+    text
+))
+
 
     conn.commit()
     conn.close()
