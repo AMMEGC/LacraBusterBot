@@ -61,25 +61,32 @@ def init_db():
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
 
-    # Tabla única y consistente
-    cur.execute(
-        """
+    # 1) Tabla principal
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS ocr_texts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             user_id INTEGER,
             message_id INTEGER,
-            file_unique_id TEXT UNIQUE,
-            image_hash TEXT,
+            file_unique_id TEXT,
             created_at TEXT,
-            ocr_text TEXT,
-            ocr_status TEXT,
-            ocr_error TEXT
+            ocr_text TEXT
         )
-        """
-    )
+    """)
 
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_created_at ON ocr_texts(created_at)")
+    # 2) Migración: agrega image_hash si no existe
+    cur.execute("PRAGMA table_info(ocr_texts)")
+    cols = {row[1] for row in cur.fetchall()}  # row[1] = nombre columna
+
+    if "image_hash" not in cols:
+        cur.execute("ALTER TABLE ocr_texts ADD COLUMN image_hash TEXT")
+    if "ocr_exit_code" not in cols:
+        cur.execute("ALTER TABLE ocr_texts ADD COLUMN ocr_exit_code INTEGER")
+    if "ocr_error" not in cols:
+        cur.execute("ALTER TABLE ocr_texts ADD COLUMN ocr_error TEXT")
+
+    # 3) Índices (ya no truena)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_file_unique_id ON ocr_texts(file_unique_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_image_hash ON ocr_texts(image_hash)")
 
     conn.commit()
