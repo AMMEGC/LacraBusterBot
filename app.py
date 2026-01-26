@@ -8,110 +8,28 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-# -------------------------
-# Config / Env
-# -------------------------
+# ---------------- CONFIG ----------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
+DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("lacra-bot")
+# ---------------- UTIL ----------------
 
+def iso_to_pretty(iso_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return iso_str
 
-# -------------------------
-# Render dummy server (health)
-# -------------------------
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+# ---------------- OCR ----------------
 
-
-def run_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
-
-
-# -------------------------
-# DB
-# -------------------------
-def init_db():
-    # Si DBPATH no tiene carpeta (raro), evita crash
-    folder = os.path.dirname(DBPATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-
-    # TABLA CORRECTA: ocr_texts (es la que usamos en inserts)
-    # dedupe: file_unique_id UNIQUE para que la misma foto no se guarde 2 veces
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ocr_texts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            user_id INTEGER,
-            message_id INTEGER,
-            file_unique_id TEXT UNIQUE,
-            created_at TEXT,
-            ocr_text TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-    log.info("DB inicializada en: %s", DBPATH)
-
-
-def get_existing_record(file_unique_id: str):
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT created_at, message_id
-        FROM ocr_texts
-        WHERE file_unique_id = ?
-        LIMIT 1
-    """, (file_unique_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row  # (created_at, message_id) o None
-
-
-def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text) -> bool:
-    """
-    Devuelve True si insertó, False si ya existía (por UNIQUE).
-    """
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO ocr_texts
-        (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        chat_id,
-        user_id,
-        message_id,
-        file_unique_id,
-        datetime.utcnow().isoformat(),
-        ocr_text
-    ))
-    inserted = (cur.rowcount == 1)
-    conn.commit()
-    conn.close()
-    return inserted
-
-
-# -------------------------
-# OCR.space
-# -------------------------
-def ocr_space(image_bytes: bytes) -> str:
+def ocr_space_bytes(image_bytes: bytes) -> str:
     if not OCR_SPACE_API_KEY:
-        log.warning("Falta OCR_SPACE_API_KEY en env vars.")
+        logging.warning("OCR_SPACE_API_KEY no configurada")
         return ""
 
     url = "https://api.ocr.space/parse/image"
@@ -131,12 +49,10 @@ def ocr_space(image_bytes: bytes) -> str:
         r.raise_for_status()
         payload = r.json()
 
-        # Log del payload para debug (se ve en Render logs)
-        log.info("OCR RAW RESPONSE: %s", payload)
+        logging.info("OCR RAW RESPONSE: %s", payload)
 
         if payload.get("IsErroredOnProcessing"):
-            err = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Error OCR desconocido"
-            log.warning("OCR errored: %s", err)
+            logging.warning("OCR error: %s", payload.get("ErrorMessage"))
             return ""
 
         results = payload.get("ParsedResults") or []
@@ -146,90 +62,135 @@ def ocr_space(image_bytes: bytes) -> str:
         return (results[0].get("ParsedText") or "").strip()
 
     except Exception as e:
-        log.exception("Fallo OCR request: %s", e)
+        logging.exception("OCR exception")
         return ""
 
+# ---------------- DB ----------------
 
-# -------------------------
-# Telegram Bot handlers
-# -------------------------
+def init_db():
+    os.makedirs(os.path.dirname(DBPATH), exist_ok=True)
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ocr_texts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            user_id INTEGER,
+            message_id INTEGER,
+            file_unique_id TEXT UNIQUE,
+            created_at TEXT,
+            ocr_text TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+    logging.info("DB inicializada en %s", DBPATH)
+
+
+def get_existing_by_file_unique_id(file_unique_id: str):
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT created_at, chat_id, user_id, message_id
+        FROM ocr_texts
+        WHERE file_unique_id = ?
+    """, (file_unique_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text):
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ocr_texts (
+            chat_id, user_id, message_id, file_unique_id, created_at, ocr_text
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        chat_id,
+        user_id,
+        message_id,
+        file_unique_id,
+        datetime.utcnow().isoformat(),
+        ocr_text
+    ))
+    conn.commit()
+    conn.close()
+
+# ---------------- RENDER DUMMY SERVER ----------------
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+# ---------------- BOT ----------------
+
 def start(update, context):
     update.message.reply_text("🤖 Bot activo. Manda una foto.")
 
 
 def photo_received(update, context):
     message = update.message
-    if not message:
+    if not message or not message.photo:
         return
 
-    # Log de entrada (esto DEBE aparecer cada que mandas foto)
-    log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s",
-             getattr(message, "chat_id", None),
-             getattr(message, "message_id", None),
-             getattr(getattr(message, "from_user", None), "id", None))
+    logging.info(
+        "PHOTO_RECEIVED chat=%s msg=%s user=%s",
+        message.chat_id,
+        message.message_id,
+        message.from_user.id
+    )
 
-    if not message.photo:
-        return
-
-    photo = message.photo[-1]  # mejor calidad
+    photo = message.photo[-1]
     file_unique_id = photo.file_unique_id
 
-    # Dedupe rápido (antes de gastar OCR)
-existing = get_existing_record(file_unique_id)
+    existing = get_existing_by_file_unique_id(file_unique_id)
     if existing:
-       created_at, old_message_id = existing
-       update.message.reply_text(
-           f"✅ Esa foto ya estaba registrada.\n"
-           f"📅 Primera vez: {created_at} UTC\n"
-           f"🧾 Msg ID original: {old_message_id}"
-    )
-    log.info("DUPLICATE ignored: file_unique_id=%s created_at=%s", file_unique_id, created_at)
-    return
-
-
-    # Descargar bytes
-    try:
-        tg_file = context.bot.get_file(photo.file_id)
-        image_bytes = bytes(tg_file.download_as_bytearray())
-    except Exception as e:
-        log.exception("No pude descargar imagen de Telegram: %s", e)
-        update.message.reply_text("❌ No pude descargar la foto. Intenta otra vez.")
+        created_at, chat_id_old, user_id_old, msg_id_old = existing
+        update.message.reply_text(
+            f"✅ Esa foto ya estaba registrada.\n"
+            f"📅 Registrada: {iso_to_pretty(created_at)}\n"
+            f"🧾 Ref: chat={chat_id_old}, msg={msg_id_old}"
+        )
+        logging.info("DUPLICATE ignored: %s", file_unique_id)
         return
 
-    # OCR
-    text = ocr_space(image_bytes)
+    file = context.bot.get_file(photo.file_id)
+    image_bytes = file.download_as_bytearray()
 
-    # Guardar
-    inserted = save_ocr(
+    text = ocr_space_bytes(image_bytes)
+
+    save_ocr(
         chat_id=message.chat_id,
-        user_id=message.from_user.id if message.from_user else None,
+        user_id=message.from_user.id,
         message_id=message.message_id,
         file_unique_id=file_unique_id,
         ocr_text=text
     )
-
-    if not inserted:
-        update.message.reply_text("✅ Esa foto ya estaba registrada.")
-        return
 
     if text.strip():
         update.message.reply_text("📄 Texto detectado y guardado.")
     else:
         update.message.reply_text("📸 Foto guardada (sin texto legible).")
 
-
-def on_error(update, context):
-    # Para que no salga “No error handlers…”
-    log.exception("TELEGRAM ERROR: %s", context.error)
-
+# ---------------- MAIN ----------------
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN en Environment Variables")
+        raise RuntimeError("Falta BOT_TOKEN")
 
     init_db()
 
-    # Server dummy para Render
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
@@ -238,9 +199,8 @@ def main():
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
-    dp.add_error_handler(on_error)
 
-    log.info("Bot arrancando polling…")
+    logging.info("Bot arrancando polling...")
     updater.start_polling()
     updater.idle()
 
