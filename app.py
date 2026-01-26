@@ -1,127 +1,29 @@
 import os
+import io
 import threading
 import sqlite3
-import logging
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
+from PIL import Image
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-# ---------------- CONFIG ----------------
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
-
-# ---------------- UTIL ----------------
-
-def iso_to_pretty(iso_str: str) -> str:
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return iso_str
-
-# ---------------- OCR ----------------
-
-def ocr_space_bytes(image_bytes: bytes) -> str:
-    if not OCR_SPACE_API_KEY:
-        logging.warning("OCR_SPACE_API_KEY no configurada")
-        return ""
-
-    url = "https://api.ocr.space/parse/image"
-    files = {"file": ("image.jpg", image_bytes)}
-    data = {
-        "apikey": OCR_SPACE_API_KEY,
-        "language": "spa",
-        "OCREngine": "2",
-        "scale": "true",
-        "detectOrientation": "true",
-        "isOverlayRequired": "false",
-        "filetype": "JPG",
-    }
-
-    try:
-        r = requests.post(url, files=files, data=data, timeout=60)
-        r.raise_for_status()
-        payload = r.json()
-
-        logging.info("OCR RAW RESPONSE: %s", payload)
-
-        if payload.get("IsErroredOnProcessing"):
-            logging.warning("OCR error: %s", payload.get("ErrorMessage"))
-            return ""
-
-        results = payload.get("ParsedResults") or []
-        if not results:
-            return ""
-
-        return (results[0].get("ParsedText") or "").strip()
-
-    except Exception as e:
-        logging.exception("OCR exception")
-        return ""
-
-# ---------------- DB ----------------
-
-def init_db():
-    os.makedirs(os.path.dirname(DBPATH), exist_ok=True)
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ocr_texts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            user_id INTEGER,
-            message_id INTEGER,
-            file_unique_id TEXT UNIQUE,
-            created_at TEXT,
-            ocr_text TEXT
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-    logging.info("DB inicializada en %s", DBPATH)
+OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 
 
-def get_existing_by_file_unique_id(file_unique_id: str):
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT created_at, chat_id, user_id, message_id
-        FROM ocr_texts
-        WHERE file_unique_id = ?
-    """, (file_unique_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+# -------------------------
+# Util: timestamp (ISO)
+# -------------------------
+def now_iso():
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text):
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO ocr_texts (
-            chat_id, user_id, message_id, file_unique_id, created_at, ocr_text
-        ) VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        chat_id,
-        user_id,
-        message_id,
-        file_unique_id,
-        datetime.utcnow().isoformat(),
-        ocr_text
-    ))
-    conn.commit()
-    conn.close()
-
-# ---------------- RENDER DUMMY SERVER ----------------
-
+# -------------------------
+# Render dummy server
+# -------------------------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -133,8 +35,123 @@ def run_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-# ---------------- BOT ----------------
 
+# -------------------------
+# DB
+# -------------------------
+def init_db():
+    os.makedirs(os.path.dirname(DBPATH), exist_ok=True)
+
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+
+    # Tabla REAL usada por tu bot (porque INSERT va a ocr_texts)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ocr_texts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            user_id INTEGER,
+            message_id INTEGER,
+            file_unique_id TEXT,
+            created_at TEXT,
+            ocr_text TEXT
+        )
+    """)
+
+    # Índice para duplicados por file_unique_id
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ocr_texts_file_unique_id
+        ON ocr_texts(file_unique_id)
+    """)
+
+    conn.commit()
+    conn.close()
+
+    print(f"{now_iso()} [INFO] DB inicializada en: {DBPATH}")
+
+
+def is_duplicate(file_unique_id: str) -> tuple[bool, str]:
+    """Regresa (True, created_at) si ya existe ese file_unique_id."""
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT created_at FROM ocr_texts WHERE file_unique_id=? LIMIT 1",
+        (file_unique_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        return True, row[0]
+    return False, ""
+
+
+def save_ocr(chat_id, user_id, message_id, file_unique_id, created_at, ocr_text):
+    conn = sqlite3.connect(DBPATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ocr_texts (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text))
+    conn.commit()
+    conn.close()
+
+
+# -------------------------
+# OCR helpers
+# -------------------------
+def to_jpeg_bytes(image_bytes: bytes) -> bytes:
+    """
+    Fuerza conversión a JPEG real (evita E301 'Input file corrupted').
+    """
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def ocr_space_bytes(image_bytes: bytes) -> str:
+    if not OCR_SPACE_API_KEY:
+        raise RuntimeError("Falta OCR_SPACE_API_KEY en Environment Variables (Render)")
+
+    # Fuerza JPEG real sí o sí
+    jpeg_bytes = to_jpeg_bytes(bytes(image_bytes))
+
+    url = "https://api.ocr.space/parse/image"
+
+    # ✅ Campo correcto: "file"
+    files = {"file": ("image.jpg", jpeg_bytes, "image/jpeg")}
+
+    data = {
+        "apikey": OCR_SPACE_API_KEY,
+        "language": "spa",
+        "OCREngine": "2",
+        "scale": "true",
+        "detectOrientation": "true",
+        "isOverlayRequired": "false",
+    }
+
+    r = requests.post(url, files=files, data=data, timeout=60)
+    r.raise_for_status()
+    payload = r.json()
+
+    print(f"{now_iso()} [INFO] OCR RAW RESPONSE >>> {payload}")
+
+    if payload.get("IsErroredOnProcessing"):
+        msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Error OCR desconocido"
+        raise RuntimeError(str(msg))
+
+    results = payload.get("ParsedResults") or []
+    if not results:
+        return ""
+
+    return (results[0].get("ParsedText") or "").strip()
+
+
+# -------------------------
+# Bot handlers
+# -------------------------
 def start(update, context):
     update.message.reply_text("🤖 Bot activo. Manda una foto.")
 
@@ -144,38 +161,39 @@ def photo_received(update, context):
     if not message or not message.photo:
         return
 
-    logging.info(
-        "PHOTO_RECEIVED chat=%s msg=%s user=%s",
-        message.chat_id,
-        message.message_id,
-        message.from_user.id
-    )
-
+    # mejor calidad
     photo = message.photo[-1]
     file_unique_id = photo.file_unique_id
 
-    existing = get_existing_by_file_unique_id(file_unique_id)
-    if existing:
-        created_at, chat_id_old, user_id_old, msg_id_old = existing
-        update.message.reply_text(
-            f"✅ Esa foto ya estaba registrada.\n"
-            f"📅 Registrada: {iso_to_pretty(created_at)}\n"
-            f"🧾 Ref: chat={chat_id_old}, msg={msg_id_old}"
-        )
-        logging.info("DUPLICATE ignored: %s", file_unique_id)
+    print(f"{now_iso()} [INFO] PHOTO_RECEIVED chat={message.chat_id} msg={message.message_id} user={message.from_user.id}")
+
+    # Duplicado
+    dup, created_at = is_duplicate(file_unique_id)
+    if dup:
+        print(f"{now_iso()} [INFO] DUPLICATE ignored: file_unique_id={file_unique_id} first_seen={created_at}")
+        update.message.reply_text(f"✅ Esa foto ya estaba registrada.\n🕒 Primera vez: {created_at}")
         return
 
-    file = context.bot.get_file(photo.file_id)
-    image_bytes = file.download_as_bytearray()
+    # Descargar imagen
+    tg_file = context.bot.get_file(photo.file_id)
+    image_bytes = tg_file.download_as_bytearray()
 
-    text = ocr_space_bytes(image_bytes)
+    # OCR
+    text = ""
+    try:
+        text = ocr_space_bytes(image_bytes)
+    except Exception as e:
+        print(f"{now_iso()} [WARNING] OCR error: {repr(e)}")
+        text = ""
 
+    created_at_now = now_iso()
     save_ocr(
-        chat_id=message.chat_id,
-        user_id=message.from_user.id,
-        message_id=message.message_id,
-        file_unique_id=file_unique_id,
-        ocr_text=text
+        message.chat_id,
+        message.from_user.id,
+        message.message_id,
+        file_unique_id,
+        created_at_now,
+        text
     )
 
     if text.strip():
@@ -183,7 +201,6 @@ def photo_received(update, context):
     else:
         update.message.reply_text("📸 Foto guardada (sin texto legible).")
 
-# ---------------- MAIN ----------------
 
 def main():
     if not BOT_TOKEN:
@@ -191,6 +208,7 @@ def main():
 
     init_db()
 
+    # Server dummy (Render)
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
@@ -200,7 +218,7 @@ def main():
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
 
-    logging.info("Bot arrancando polling...")
+    print(f"{now_iso()} [INFO] Bot arrancando polling...")
     updater.start_polling()
     updater.idle()
 
