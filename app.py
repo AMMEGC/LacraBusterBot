@@ -106,7 +106,7 @@ def ocr_space_bytes(image_bytes: bytes) -> str:
     r = requests.post(url, files=files, data=data, timeout=60)
     r.raise_for_status()
     payload = r.json()
-print("OCR RAW RESULT:", payload)
+    print("OCR RAW RESULT:", payload)
 
     if payload.get("IsErroredOnProcessing"):
         msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Error OCR desconocido"
