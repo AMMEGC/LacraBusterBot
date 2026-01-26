@@ -99,7 +99,7 @@ def ocr_space_bytes(image_bytes: bytes) -> str:
     "language": "spa",
     "OCREngine": "2",
     "scale": "true",
-    "detectOrientation": "true"
+    "detectOrientation": "true",
     "isOverlayRequired": "false",
     "filetype": "JPG"
 }
