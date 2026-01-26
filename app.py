@@ -1,24 +1,37 @@
 import os
-import io
 import threading
 import sqlite3
 import logging
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from io import BytesIO
 
 import requests
-from PIL import Image
-
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
-# =========================
-# Config / Logging
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Pillow (para convertir a JPG real)
+from PIL import Image
 
+# (Opcional) ImageHash para “similitud” futura. Si no está, no rompe nada.
+try:
+    import imagehash
+except Exception:
+    imagehash = None
+
+
+# =========================
+# Config
+# =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
+OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
+
+# Logging “tipo servidor” (sale en Render logs)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("lacra")
 
 
 # =========================
@@ -29,6 +42,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+
+    # quita ruido en logs
+    def log_message(self, format, *args):
+        return
 
 
 def run_server():
@@ -44,98 +61,103 @@ def init_db():
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
 
-    # Tabla única
-    cur.execute("""
+    # Tabla única y consistente
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS ocr_texts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             user_id INTEGER,
             message_id INTEGER,
-            file_unique_id TEXT,
+            file_unique_id TEXT UNIQUE,
+            image_hash TEXT,
             created_at TEXT,
-            ocr_text TEXT
+            ocr_text TEXT,
+            ocr_status TEXT,
+            ocr_error TEXT
         )
-    """)
+        """
+    )
 
-    # Índice para duplicados
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_ocr_texts_file_unique_id
-        ON ocr_texts(file_unique_id)
-    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_created_at ON ocr_texts(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_image_hash ON ocr_texts(image_hash)")
 
     conn.commit()
     conn.close()
-    logging.info(f"DB inicializada en: {DBPATH}")
+    log.info("DB inicializada en: %s", DBPATH)
 
 
-def is_duplicate(file_unique_id: str) -> bool:
+def get_existing_created_at(file_unique_id: str):
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM ocr_texts WHERE file_unique_id = ? LIMIT 1", (file_unique_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def get_first_seen(file_unique_id: str):
-    """Regresa created_at del primer registro (ASC) para ese file_unique_id."""
-    conn = sqlite3.connect(DBPATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT created_at FROM ocr_texts WHERE file_unique_id = ? ORDER BY id ASC LIMIT 1",
-        (file_unique_id,),
-    )
+    cur.execute("SELECT created_at FROM ocr_texts WHERE file_unique_id = ? LIMIT 1", (file_unique_id,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
 
 
-def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text):
+def insert_record(chat_id, user_id, message_id, file_unique_id, image_hash, created_at, ocr_text, ocr_status, ocr_error):
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO ocr_texts (chat_id, user_id, message_id, file_unique_id, created_at, ocr_text)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        chat_id,
-        user_id,
-        message_id,
-        file_unique_id,
-        datetime.now(timezone.utc).isoformat(),
-        ocr_text
-    ))
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO ocr_texts
+        (chat_id, user_id, message_id, file_unique_id, image_hash, created_at, ocr_text, ocr_status, ocr_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (chat_id, user_id, message_id, file_unique_id, image_hash, created_at, ocr_text, ocr_status, ocr_error),
+    )
     conn.commit()
     conn.close()
 
 
 # =========================
-# Image -> Valid JPEG bytes
+# Imagen -> JPG REAL (baseline)
 # =========================
-def to_valid_jpeg_bytes(image_bytes: bytes) -> bytes:
+def to_real_jpeg_bytes(src_bytes: bytes) -> bytes:
     """
-    Telegram a veces manda bytes que OCR.space interpreta mal.
-    Aquí abrimos con Pillow y re-guardamos como JPEG real.
+    Convierte cualquier cosa que mande Telegram (webp, jpg raro, etc.)
+    a un JPG baseline REAL (RGB, no progressive).
     """
-    img = Image.open(io.BytesIO(image_bytes))
-    img = img.convert("RGB")
+    with Image.open(BytesIO(src_bytes)) as im:
+        if im.mode not in ("RGB",):
+            im = im.convert("RGB")
 
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=92, optimize=True)
-    return out.getvalue()
+        out = BytesIO()
+        im.save(
+            out,
+            format="JPEG",
+            quality=90,
+            optimize=True,
+            progressive=False,  # <-- CLAVE: baseline real
+        )
+        return out.getvalue()
+
+
+def compute_hash(jpeg_bytes: bytes) -> str:
+    if not imagehash:
+        return None
+    try:
+        with Image.open(BytesIO(jpeg_bytes)) as im:
+            return str(imagehash.phash(im))
+    except Exception:
+        return None
 
 
 # =========================
-# OCR.space call
+# OCR.space
 # =========================
 def ocr_space_bytes(image_bytes: bytes) -> str:
     if not OCR_SPACE_API_KEY:
         raise RuntimeError("Falta OCR_SPACE_API_KEY en Environment Variables (Render)")
 
-    # Forzar JPEG válido
-    jpeg_bytes = to_valid_jpeg_bytes(image_bytes)
-
     url = "https://api.ocr.space/parse/image"
-    files = {"file": ("image.jpg", jpeg_bytes, "image/jpeg")}
+
+    # OCR.space es MUY sensible al file “de verdad”
+    files = {
+        "file": ("image.jpg", image_bytes, "image/jpeg")
+    }
+
     data = {
         "apikey": OCR_SPACE_API_KEY,
         "language": "spa",
@@ -150,10 +172,14 @@ def ocr_space_bytes(image_bytes: bytes) -> str:
     r.raise_for_status()
     payload = r.json()
 
-    logging.info(f"OCR RAW RESPONSE: {payload}")
+    # Log completo (como lo pedías)
+    log.info("OCR RAW RESPONSE >>> %s", payload)
 
     if payload.get("IsErroredOnProcessing"):
         msg = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "Error OCR desconocido"
+        # a veces ErrorMessage viene como lista
+        if isinstance(msg, list):
+            msg = " | ".join([str(x) for x in msg])
         raise RuntimeError(str(msg))
 
     results = payload.get("ParsedResults") or []
@@ -164,10 +190,24 @@ def ocr_space_bytes(image_bytes: bytes) -> str:
 
 
 # =========================
-# Telegram bot handlers
+# Bot handlers
 # =========================
 def start(update, context):
     update.message.reply_text("🤖 Bot activo. Manda una foto.")
+
+
+def format_when(iso_utc: str) -> str:
+    """
+    Guarda todo en UTC. Al usuario le mostramos claro “UTC”.
+    """
+    try:
+        dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return iso_utc
 
 
 def photo_received(update, context):
@@ -175,68 +215,111 @@ def photo_received(update, context):
     if not message or not message.photo:
         return
 
-    photo = message.photo[-1]  # mejor calidad
+    # Mejor calidad
+    photo = message.photo[-1]
     file_unique_id = photo.file_unique_id
 
-    logging.info(f"PHOTO_RECEIVED chat={message.chat_id} msg={message.message_id} user={message.from_user.id}")
+    log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s file_unique_id=%s",
+             message.chat_id, message.message_id, message.from_user.id, file_unique_id)
 
-    # Duplicado
-    if is_duplicate(file_unique_id):
-        first_seen = get_first_seen(file_unique_id)
-        if first_seen:
-            update.message.reply_text(f"✅ Esa foto ya estaba registrada.\n🕒 Primera vez: {first_seen} (UTC)")
-        else:
-            update.message.reply_text("✅ Esa foto ya estaba registrada.")
-        logging.info(f"DUPLICATE ignored: {file_unique_id} first_seen={first_seen}")
+    # 1) Duplicado exacto por file_unique_id (rápido y fiable)
+    existing_created_at = get_existing_created_at(file_unique_id)
+    if existing_created_at:
+        when = format_when(existing_created_at)
+        update.message.reply_text(f"✅ Esa foto ya estaba registrada.\n🕒 Primera vez: {when}")
+        log.info("DUPLICATE ignored: file_unique_id=%s first_seen=%s", file_unique_id, existing_created_at)
         return
 
-    # Descargar bytes desde Telegram
-    file = context.bot.get_file(photo.file_id)
-    image_bytes = file.download_as_bytearray()
+    # 2) Descargar bytes reales desde Telegram
+    tg_file = context.bot.get_file(photo.file_id)
+    src_bytes = tg_file.download_as_bytearray()
 
-    # OCR
-    text = ""
+    # 3) Convertir a JPG REAL antes de OCR (CLAVE)
     try:
-        text = ocr_space_bytes(image_bytes)
+        jpeg_bytes = to_real_jpeg_bytes(src_bytes)
     except Exception as e:
-        logging.warning(f"OCR error: {e}")
-        text = ""
+        log.exception("JPEG conversion failed: %s", e)
+        # guardamos registro igual, para no perder evidencia
+        created_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        insert_record(
+            message.chat_id, message.from_user.id, message.message_id,
+            file_unique_id, None, created_at,
+            "", "jpeg_failed", str(e)
+        )
+        update.message.reply_text("⚠️ No pude convertir la imagen a JPG. Intenta con otra foto.")
+        return
 
-    # Guardar DB (aunque no haya texto)
-    save_ocr(
-        chat_id=message.chat_id,
-        user_id=message.from_user.id,
-        message_id=message.message_id,
-        file_unique_id=file_unique_id,
-        ocr_text=text
+    img_hash = compute_hash(jpeg_bytes)
+
+    # 4) OCR
+    created_at = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+    ocr_text = ""
+    ocr_status = "ok"
+    ocr_error = None
+
+    try:
+        ocr_text = ocr_space_bytes(jpeg_bytes)
+        if not ocr_text.strip():
+            ocr_status = "empty"
+    except Exception as e:
+        ocr_status = "error"
+        ocr_error = str(e)
+        log.warning("OCR error: %s", ocr_error)
+
+    # 5) Guardar en DB (aunque falle OCR, guardamos)
+    insert_record(
+        message.chat_id,
+        message.from_user.id,
+        message.message_id,
+        file_unique_id,
+        img_hash,
+        created_at,
+        ocr_text,
+        ocr_status,
+        ocr_error,
     )
 
-    if text.strip():
+    # 6) Respuesta al usuario
+    if ocr_status == "ok" and ocr_text.strip():
         update.message.reply_text("📄 Texto detectado y guardado.")
-    else:
+    elif ocr_status == "empty":
         update.message.reply_text("📸 Foto guardada (sin texto legible).")
+    else:
+        # si OCR falló, por lo menos lo decimos
+        update.message.reply_text("📸 Foto guardada (OCR falló / sin texto legible).")
 
 
+# =========================
+# Main
+# =========================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN")
+        raise RuntimeError("Falta BOT_TOKEN en Environment Variables")
 
     init_db()
 
-    # Server dummy (Render)
+    # Dummy server para Render
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Identidad del bot (para que NO haya dudas de token)
+    try:
+        me = updater.bot.get_me()
+        log.info("Bot conectado: @%s (id=%s)", me.username, me.id)
+    except Exception as e:
+        log.warning("No pude obtener get_me(): %s", e)
+
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
 
-    logging.info("Bot arrancando polling...")
+    log.info("Bot arrancando polling...")
     updater.start_polling()
     updater.idle()
 
 
 if __name__ == "__main__":
     main()
+
