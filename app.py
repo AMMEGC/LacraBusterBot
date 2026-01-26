@@ -157,7 +157,7 @@ def extract_name_block_ine(text_norm: str) -> str:
     return " ".join(cleaned).strip()
 
 # =========================
-# Document profiles (Option 2)
+# Document profiles
 # =========================
 DOC_PROFILES = {
     "INE_MX": {
@@ -500,7 +500,7 @@ def insert_record(
     conn.close()
 
 # =========================
-# Diff logic per profile
+# Diff logic
 # =========================
 def diff_fields_by_profile(doc_type: str, prev_fields: dict, now_fields: dict):
     prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
@@ -510,6 +510,25 @@ def diff_fields_by_profile(doc_type: str, prev_fields: dict, now_fields: dict):
     for k in keys:
         a = (prev_fields.get(k) or "").strip()
         b = (now_fields.get(k) or "").strip()
+        if a and b and a != b:
+            diffs.append((k, a, b))
+        elif a == "" and b != "":
+            diffs.append((k, "(vacío)", b))
+        elif a != "" and b == "":
+            diffs.append((k, a, "(vacío)"))
+    return diffs
+
+def diff_fields_generic(prev_fields: dict, now_fields: dict):
+    # Compara todo lo que exista en cualquiera de los dos
+    keys = sorted(set(prev_fields.keys()) | set(now_fields.keys()))
+    diffs = []
+    for k in keys:
+        if k in ("name",):
+            continue
+        a = (prev_fields.get(k) or "").strip()
+        b = (now_fields.get(k) or "").strip()
+        if a == b:
+            continue
         if a and b and a != b:
             diffs.append((k, a, b))
         elif a == "" and b != "":
@@ -560,7 +579,7 @@ def photo_received(update, context):
 
         tg_file = context.bot.get_file(photo.file_id)
         raw_bytes = tg_file.download_as_bytearray()
-        raw_bytes = bytes(raw_bytes)  # <- importante
+        raw_bytes = bytes(raw_bytes)
 
         # JPEG + pHash
         try:
@@ -645,7 +664,6 @@ def photo_received(update, context):
         # If exact duplicate -> reply and do not insert
         if exact:
             kind, row = exact
-            # row = (id, created_at, message_id, text_hash, image_hash)
             first_seen_iso = row[1]
             when = format_cdmx(first_seen_iso)
             update.message.reply_text(
@@ -671,6 +689,9 @@ def photo_received(update, context):
                 prev_fields = {}
 
             diffs = diff_fields_by_profile(doc_type, prev_fields, fields)
+            if not diffs:
+                # Si el doc_type no tiene diff_fields (ej: UNKNOWN), intenta comparación genérica
+                diffs = diff_fields_generic(prev_fields, fields)
 
             if diffs:
                 pretty = []
@@ -680,14 +701,29 @@ def photo_received(update, context):
             else:
                 changes_note = "\n\n🧾 Sin cambios detectables (con lo que leyó el OCR)."
 
+        # Suggestions note (más legible)
         fuzzy_note = ""
         if suggestions:
             lines = []
             for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev) in suggestions:
                 when = format_cdmx(created_at)
-                lines.append(f"• {int(combined*100)}% (img {int(img_s*100)}%, nombre {int(name_s*100)}%) — {when} — {dtyp}")
-            fuzzy_note = "\n\n🟠 Sugerencias (no seguro):\n" + "\n".join(lines)
 
+                parts = []
+                if img_s > 0:
+                    parts.append(f"📸 foto parecida {int(img_s*100)}%")
+                else:
+                    parts.append("📸 sin comparación de foto")
+
+                if name_s > 0:
+                    parts.append(f"🧑 nombre parecido {int(name_s*100)}%")
+                else:
+                    parts.append("🧑 nombre no detectado / no comparable")
+
+                lines.append(f"• Posible match — {', '.join(parts)}\n  🕒 {when} — {dtyp}")
+
+            fuzzy_note = "\n\n🟠 Sugerencias (no confirmadas):\n" + "\n".join(lines)
+
+        # Insert record
         insert_record(
             chat_id=chat_id,
             user_id=user_id,
@@ -706,6 +742,7 @@ def photo_received(update, context):
             person_key_type=person_key_type,
         )
 
+        # Reply
         if ocr_status == "ok" and ocr_text.strip():
             shown = ocr_text.strip()
             if len(shown) > 2500:
@@ -762,4 +799,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
