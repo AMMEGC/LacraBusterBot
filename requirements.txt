@@ -1,7 +1,7 @@
 python-telegram-bot==13.15
 fastapi==0.110.0
 uvicorn==0.27.1
-Pillow
+Pillow==10.4.0
 ImageHash
 pytesseract
 requests==2.32.3
