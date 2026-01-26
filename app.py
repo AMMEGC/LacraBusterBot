@@ -181,7 +181,6 @@ DOC_PROFILES = {
         "keywords": ["PASAPORTE", "ESTADOS UNIDOS MEXICANOS", "MEXICO", "PASSPORT", "NATIONALITY", "NACIONALIDAD"],
         "id_fields_priority": ["passport_no", "curp"],
         "fields": {
-            # Pasaportes varían mucho; aquí lo más útil es número y fechas.
             "passport_no": {"regex": re.compile(r"\b([A-Z]\d{7,9}|\d{8,10})\b")},
             "dob": {"regex": re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{2}\s?[A-Z]{3}\s?\d{4})\b")},
             "nationality": {"regex": re.compile(r"\b(MEXICANA|MEXICAN|MEXICO)\b")},
@@ -214,6 +213,24 @@ DOC_PROFILES = {
 }
 
 def detect_doc_type(text_norm: str) -> str:
+    # Heurística fuerte para INE aunque falten keywords exactas
+    ine_signals = 0
+    if "CREDENCIAL PARA VOTAR" in text_norm:
+        ine_signals += 2
+    if "INSTITUTO NACIONAL ELECTORAL" in text_norm or "INSTITUTO FEDERAL ELECTORAL" in text_norm:
+        ine_signals += 2
+    if "CLAVE DE ELECTOR" in text_norm:
+        ine_signals += 2
+    if "DOMICILIO" in text_norm:
+        ine_signals += 1
+    if "SECCION" in text_norm:
+        ine_signals += 1
+    if CURP_RE.search(text_norm):
+        ine_signals += 2
+
+    if ine_signals >= 4:
+        return "INE_MX"
+
     best = ("UNKNOWN", 0)
     for dt, prof in DOC_PROFILES.items():
         if dt == "UNKNOWN":
@@ -230,7 +247,6 @@ def extract_by_profile(text_norm: str, doc_type: str) -> dict:
     for field, spec in prof.get("fields", {}).items():
         val = ""
 
-        # Special: INE name extraction is better with label block
         if doc_type == "INE_MX" and field == "name":
             val = extract_name_block_ine(text_norm)
 
@@ -261,7 +277,6 @@ def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
         if v:
             return v, f"{doc_type}:{k}"
 
-    # Fallback: name+dob
     name = (fields.get("name") or "").strip()
     dob = (fields.get("dob") or "").strip()
     if name and dob:
@@ -362,7 +377,6 @@ def db_conn():
 # DB queries
 # =========================
 def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
-    # 1) Duplicado REAL por texto (lo más confiable)
     if text_hash:
         cur.execute("""
             SELECT id, created_at, message_id, text_hash, image_hash
@@ -374,8 +388,6 @@ def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
         if row:
             return ("TEXT", row)
 
-    # 2) Por imagen SOLO lo consideramos duplicado si TAMBIÉN coincide el texto.
-    # Esto evita que “pHash igual” bloquee cambios de domicilio.
     if image_hash and text_hash:
         cur.execute("""
             SELECT id, created_at, message_id, text_hash, image_hash
@@ -428,7 +440,6 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
         img_score = 0.0
         name_score = 0.0
 
-        # name from stored fields_json
         try:
             f = json.loads(fields_json) if fields_json else {}
         except Exception:
@@ -533,185 +544,201 @@ def start(update, context):
     update.message.reply_text("🤖 Bot activo. Mándame una foto.")
 
 def photo_received(update, context):
-    msg = update.message
-    if not msg or not msg.photo:
-        return
-
-    chat_id = msg.chat_id
-    user_id = msg.from_user.id
-    message_id = msg.message_id
-
-    photo = msg.photo[-1]
-    file_unique_id = photo.file_unique_id
-
-    log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s file_unique_id=%s", chat_id, message_id, user_id, file_unique_id)
-
-    tg_file = context.bot.get_file(photo.file_id)
-    raw_bytes = tg_file.download_as_bytearray()
-
-    # JPEG + pHash
     try:
-        jpeg_bytes = to_real_jpeg_bytes(raw_bytes)
-        img_hash = compute_image_phash_hex(jpeg_bytes)
-    except Exception as e:
-        jpeg_bytes = bytes(raw_bytes)
-        img_hash = ""
-        log.warning("JPEG conversion/hash failed: %s", e)
+        msg = update.message
+        if not msg or not msg.photo:
+            return
 
-    # OCR
-    ocr_text = ""
-    ocr_status = "ok"
-    ocr_error = ""
-    try:
-        ocr_text = ocr_space_bytes(jpeg_bytes)
-        if not ocr_text.strip():
-            ocr_status = "empty"
-    except Exception as e:
-        ocr_status = "error"
-        ocr_error = str(e)
-        log.warning("OCR error: %s", ocr_error)
+        chat_id = msg.chat_id
+        user_id = msg.from_user.id
+        message_id = msg.message_id
 
-    # Normalize + hashes
-    text_norm = normalize_text_for_hash(ocr_text)
-    text_hash = sha256_hex(text_norm) if text_norm else ""
+        photo = msg.photo[-1]
+        file_unique_id = photo.file_unique_id
 
-    # Doc type + fields
-    doc_type = detect_doc_type(text_norm)
-    fields = extract_by_profile(text_norm, doc_type)
+        log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s file_unique_id=%s", chat_id, message_id, user_id, file_unique_id)
 
-    # Ensure INE pulls curp/clave/name better
-    if doc_type == "INE_MX":
-        if "name" not in fields:
-            fields["name"] = extract_name_block_ine(text_norm)
-        if "curp" not in fields:
-            m = CURP_RE.search(text_norm)
-            if m:
-                fields["curp"] = m.group(0)
-        if "clave_elector" not in fields:
-            if "CLAVE DE ELECTOR" in text_norm:
-                idx = text_norm.find("CLAVE DE ELECTOR")
-                window = text_norm[idx: idx + 350]
-                m2 = CLAVE_ELECTOR_RE.search(window)
-                if m2:
-                    fields["clave_elector"] = m2.group(0)
-            if "clave_elector" not in fields:
-                m3 = CLAVE_ELECTOR_RE.search(text_norm)
-                if m3:
-                    fields["clave_elector"] = m3.group(0)
-        if "dob" not in fields:
-            m4 = DOB_RE.search(text_norm)
-            if m4:
-                fields["dob"] = m4.group(0)
+        tg_file = context.bot.get_file(photo.file_id)
+        raw_bytes = tg_file.download_as_bytearray()
+        raw_bytes = bytes(raw_bytes)  # <- importante
 
-    # person key (ID fuerte por perfil)
-    person_key, person_key_type = build_person_key(doc_type, fields)
-
-    created_at_iso = datetime.now(timezone.utc).isoformat()
-
-    conn = db_conn()
-    cur = conn.cursor()
-
-    # 1) exact duplicates (text/image)
-    exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
-
-    # 2) same person by person_key
-    first_person = None
-    latest_person = None
-    if person_key:
-        first_person = find_first_by_person(cur, chat_id, person_key)
-        latest_person = find_latest_by_person(cur, chat_id, person_key)
-
-    # 3) fuzzy suggestions (optional)
-    name_now = (fields.get("name") or "").strip()
-    suggestions = []
-    if not first_person:  # only if no strong match
+        # JPEG + pHash
         try:
-            suggestions = find_fuzzy_suggestions(cur, chat_id, name_now, img_hash)
+            jpeg_bytes = to_real_jpeg_bytes(raw_bytes)
+            img_hash = compute_image_phash_hex(jpeg_bytes)
         except Exception as e:
-            log.warning("Fuzzy suggestion error: %s", e)
+            jpeg_bytes = raw_bytes
+            img_hash = ""
+            log.warning("JPEG conversion/hash failed: %s", e)
 
-    conn.close()
-
-    # If exact duplicate -> reply and do not insert
-    if exact:
-        kind, row = exact
-        _, first_seen_iso, _first_mid = row
-        when = format_cdmx(first_seen_iso)
-        update.message.reply_text(
-            f"✅ Ya estaba registrada.\n"
-            f"🕒 Primera vez: {when}\n"
-            f"🔎 Coincidencia: {'TEXTO' if kind=='TEXT' else 'IMAGEN'}"
-        )
-        return
-
-    # If same person -> compute changes vs latest record
-    person_note = ""
-    changes_note = ""
-
-    if first_person and latest_person:
-        _id1, first_seen_iso, _mid1, doc_first, pk_type = first_person
-        _idl, last_seen_iso, _midl, doc_last, prev_fields_json = latest_person
-
-        person_note = f"\n🟡 Misma persona detectada ({pk_type}).\n🕒 Primera vez: {format_cdmx(first_seen_iso)}"
-
+        # OCR
+        ocr_text = ""
+        ocr_status = "ok"
+        ocr_error = ""
         try:
-            prev_fields = json.loads(prev_fields_json) if prev_fields_json else {}
-        except Exception:
-            prev_fields = {}
+            ocr_text = ocr_space_bytes(jpeg_bytes)
+            if not ocr_text.strip():
+                ocr_status = "empty"
+        except Exception as e:
+            ocr_status = "error"
+            ocr_error = str(e)
+            log.warning("OCR error: %s", ocr_error)
 
-        # If doc_type changed between records, still compare using current doc_type rules (best effort)
-        diffs = diff_fields_by_profile(doc_type, prev_fields, fields)
+        # Normalize + hashes
+        text_norm = normalize_text_for_hash(ocr_text)
+        text_hash = sha256_hex(text_norm) if text_norm else ""
 
-        if diffs:
-            pretty = []
-            for k, a, b in diffs:
-                pretty.append(f"{pretty_label(k)}\nANTES:\n{a}\nAHORA:\n{b}")
-            changes_note = "\n\n🧾 Cambios detectados:\n\n" + "\n\n".join(pretty)
-        else:
-            # Sometimes OCR reads one field and not the other; say best-effort.
-            changes_note = "\n\n🧾 Sin cambios detectables (con lo que leyó el OCR)."
+        # Doc type + fields
+        doc_type = detect_doc_type(text_norm)
+        fields = extract_by_profile(text_norm, doc_type)
 
-    # Suggestions note
-    fuzzy_note = ""
-    if suggestions:
-        lines = []
-        for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev) in suggestions:
-            when = format_cdmx(created_at)
-            lines.append(f"• {int(combined*100)}% (img {int(img_s*100)}%, nombre {int(name_s*100)}%) — {when} — {dtyp}")
-        fuzzy_note = "\n\n🟠 Sugerencias (no seguro):\n" + "\n".join(lines)
+        # Ensure INE pulls curp/clave/name better
+        if doc_type == "INE_MX":
+            if "name" not in fields:
+                fields["name"] = extract_name_block_ine(text_norm)
+            if "curp" not in fields:
+                m = CURP_RE.search(text_norm)
+                if m:
+                    fields["curp"] = m.group(0)
+            if "clave_elector" not in fields:
+                if "CLAVE DE ELECTOR" in text_norm:
+                    idx = text_norm.find("CLAVE DE ELECTOR")
+                    window = text_norm[idx: idx + 350]
+                    m2 = CLAVE_ELECTOR_RE.search(window)
+                    if m2:
+                        fields["clave_elector"] = m2.group(0)
+                if "clave_elector" not in fields:
+                    m3 = CLAVE_ELECTOR_RE.search(text_norm)
+                    if m3:
+                        fields["clave_elector"] = m3.group(0)
+            if "dob" not in fields:
+                m4 = DOB_RE.search(text_norm)
+                if m4:
+                    fields["dob"] = m4.group(0)
 
-    # Insert record (always insert new if not exact duplicate)
-    insert_record(
-        chat_id=chat_id,
-        user_id=user_id,
-        message_id=message_id,
-        file_unique_id=file_unique_id,
-        created_at_iso=created_at_iso,
-        ocr_text=ocr_text,
-        ocr_status=ocr_status,
-        ocr_error=ocr_error,
-        image_hash=img_hash,
-        text_norm=text_norm,
-        text_hash=text_hash,
-        doc_type=doc_type,
-        fields=fields,
-        person_key=person_key,
-        person_key_type=person_key_type,
-    )
+        # person key (ID fuerte por perfil)
+        person_key, person_key_type = build_person_key(doc_type, fields)
 
-    # Reply with OCR text and notes
-    if ocr_status == "ok" and ocr_text.strip():
-        shown = ocr_text.strip()
-        if len(shown) > 2500:
-            shown = shown[:2500] + "\n…(recortado)"
-        update.message.reply_text(
-            f"📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
-            + person_note + changes_note + fuzzy_note
+        created_at_iso = datetime.now(timezone.utc).isoformat()
+
+        conn = db_conn()
+        cur = conn.cursor()
+
+        exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
+
+        first_person = None
+        latest_person = None
+        if person_key:
+            first_person = find_first_by_person(cur, chat_id, person_key)
+            latest_person = find_latest_by_person(cur, chat_id, person_key)
+
+        name_now = (fields.get("name") or "").strip()
+        suggestions = []
+        if not first_person:
+            try:
+                suggestions = find_fuzzy_suggestions(cur, chat_id, name_now, img_hash)
+            except Exception as e:
+                log.warning("Fuzzy suggestion error: %s", e)
+
+        conn.close()
+
+        # If exact duplicate -> reply and do not insert
+        if exact:
+            kind, row = exact
+            # row = (id, created_at, message_id, text_hash, image_hash)
+            first_seen_iso = row[1]
+            when = format_cdmx(first_seen_iso)
+            update.message.reply_text(
+                f"✅ Ya estaba registrada.\n"
+                f"🕒 Primera vez: {when}\n"
+                f"🔎 Coincidencia: {'TEXTO' if kind=='TEXT' else 'IMAGEN'}"
+            )
+            return
+
+        # If same person -> compute changes vs latest record
+        person_note = ""
+        changes_note = ""
+
+        if first_person and latest_person:
+            _id1, first_seen_iso, _mid1, _doc_first, pk_type = first_person
+            _idl, _last_seen_iso, _midl, _doc_last, prev_fields_json = latest_person
+
+            person_note = f"\n🟡 Misma persona detectada ({pk_type}).\n🕒 Primera vez: {format_cdmx(first_seen_iso)}"
+
+            try:
+                prev_fields = json.loads(prev_fields_json) if prev_fields_json else {}
+            except Exception:
+                prev_fields = {}
+
+            diffs = diff_fields_by_profile(doc_type, prev_fields, fields)
+
+            if diffs:
+                pretty = []
+                for k, a, b in diffs:
+                    pretty.append(f"{pretty_label(k)}\nANTES:\n{a}\nAHORA:\n{b}")
+                changes_note = "\n\n🧾 Cambios detectados:\n\n" + "\n\n".join(pretty)
+            else:
+                changes_note = "\n\n🧾 Sin cambios detectables (con lo que leyó el OCR)."
+
+        fuzzy_note = ""
+        if suggestions:
+            lines = []
+            for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev) in suggestions:
+                when = format_cdmx(created_at)
+                lines.append(f"• {int(combined*100)}% (img {int(img_s*100)}%, nombre {int(name_s*100)}%) — {when} — {dtyp}")
+            fuzzy_note = "\n\n🟠 Sugerencias (no seguro):\n" + "\n".join(lines)
+
+        insert_record(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=message_id,
+            file_unique_id=file_unique_id,
+            created_at_iso=created_at_iso,
+            ocr_text=ocr_text,
+            ocr_status=ocr_status,
+            ocr_error=ocr_error,
+            image_hash=img_hash,
+            text_norm=text_norm,
+            text_hash=text_hash,
+            doc_type=doc_type,
+            fields=fields,
+            person_key=person_key,
+            person_key_type=person_key_type,
         )
-    elif ocr_status == "empty":
-        update.message.reply_text(f"📸 Foto guardada (sin texto legible) ({doc_type})." + person_note + changes_note + fuzzy_note)
-    else:
-        update.message.reply_text(f"📸 Foto guardada, pero el OCR falló ({doc_type})." + person_note + changes_note + fuzzy_note)
+
+        if ocr_status == "ok" and ocr_text.strip():
+            shown = ocr_text.strip()
+            if len(shown) > 2500:
+                shown = shown[:2500] + "\n…(recortado)"
+            update.message.reply_text(
+                f"📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                + person_note + changes_note + fuzzy_note
+            )
+        elif ocr_status == "empty":
+            update.message.reply_text(
+                f"📸 Foto guardada (sin texto legible) ({doc_type})."
+                + person_note + changes_note + fuzzy_note
+            )
+        else:
+            update.message.reply_text(
+                f"📸 Foto guardada, pero el OCR falló ({doc_type})."
+                + person_note + changes_note + fuzzy_note
+            )
+
+    except Exception:
+        log.exception("Error en photo_received")
+        try:
+            update.message.reply_text("⚠️ Se cayó algo procesando tu foto. Revisa logs en Render.")
+        except Exception:
+            pass
+
+def error_handler(update, context):
+    log.exception("Unhandled exception:", exc_info=context.error)
+    try:
+        if update and getattr(update, "message", None):
+            update.message.reply_text("⚠️ Error interno. Ya quedó en logs.")
+    except Exception:
+        pass
 
 def main():
     if not BOT_TOKEN:
@@ -719,7 +746,6 @@ def main():
 
     init_db()
 
-    # Render dummy server
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
@@ -728,6 +754,7 @@ def main():
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
+    dp.add_error_handler(error_handler)
 
     log.info("Bot arrancando polling...")
     updater.start_polling()
