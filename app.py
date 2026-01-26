@@ -60,6 +60,8 @@ def init_db():
     os.makedirs(os.path.dirname(DBPATH), exist_ok=True)
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
+
+    # Tabla original (la que ya tenías)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ocr_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,8 +73,23 @@ def init_db():
             ocr_text TEXT
         )
     """)
+
+    # Tabla que SÍ estás usando en los INSERT
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ocr_texts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            user_id INTEGER,
+            message_id INTEGER,
+            file_unique_id TEXT,
+            created_at TEXT,
+            ocr_text TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
 
 
 def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text):
@@ -128,6 +145,7 @@ def start(update, context):
 
 
 def photo_received(update, context):
+    print("PHOTO_RECEIVED from chat:", message.chat_id, "msg:", message.message_id, flush=True)
     message = update.message
 
     if not message.photo:
@@ -138,7 +156,7 @@ def photo_received(update, context):
     file = context.bot.get_file(photo.file_id)
     image_bytes = file.download_as_bytearray()
 
-    text = ocr_space_extract_text(image_bytes)
+    text = ocr_space_bytes(image_bytes)
 
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
