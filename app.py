@@ -68,13 +68,18 @@ def init_db():
     log.info("DB inicializada en: %s", DBPATH)
 
 
-def already_processed(file_unique_id: str) -> bool:
+def get_existing_record(file_unique_id: str):
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM ocr_texts WHERE file_unique_id = ? LIMIT 1", (file_unique_id,))
+    cur.execute("""
+        SELECT created_at, message_id
+        FROM ocr_texts
+        WHERE file_unique_id = ?
+        LIMIT 1
+    """, (file_unique_id,))
     row = cur.fetchone()
     conn.close()
-    return row is not None
+    return row  # (created_at, message_id) o None
 
 
 def save_ocr(chat_id, user_id, message_id, file_unique_id, ocr_text) -> bool:
@@ -170,10 +175,17 @@ def photo_received(update, context):
     file_unique_id = photo.file_unique_id
 
     # Dedupe rápido (antes de gastar OCR)
-    if already_processed(file_unique_id):
-        update.message.reply_text("✅ Esa foto ya estaba registrada.")
-        log.info("DUPLICATE ignored: file_unique_id=%s", file_unique_id)
-        return
+existing = get_existing_record(file_unique_id)
+    if existing:
+       created_at, old_message_id = existing
+       update.message.reply_text(
+           f"✅ Esa foto ya estaba registrada.\n"
+           f"📅 Primera vez: {created_at} UTC\n"
+           f"🧾 Msg ID original: {old_message_id}"
+    )
+    log.info("DUPLICATE ignored: file_unique_id=%s created_at=%s", file_unique_id, created_at)
+    return
+
 
     # Descargar bytes
     try:
