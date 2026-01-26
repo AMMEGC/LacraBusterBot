@@ -362,9 +362,11 @@ def db_conn():
 # DB queries
 # =========================
 def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
+    # 1) Duplicado REAL por texto (lo más confiable)
     if text_hash:
         cur.execute("""
-            SELECT id, created_at, message_id FROM ocr_texts
+            SELECT id, created_at, message_id, text_hash, image_hash
+            FROM ocr_texts
             WHERE chat_id=? AND text_hash=?
             ORDER BY id ASC LIMIT 1
         """, (chat_id, text_hash))
@@ -372,15 +374,20 @@ def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
         if row:
             return ("TEXT", row)
 
-    if image_hash:
+    # 2) Por imagen SOLO lo consideramos duplicado si TAMBIÉN coincide el texto.
+    # Esto evita que “pHash igual” bloquee cambios de domicilio.
+    if image_hash and text_hash:
         cur.execute("""
-            SELECT id, created_at, message_id FROM ocr_texts
+            SELECT id, created_at, message_id, text_hash, image_hash
+            FROM ocr_texts
             WHERE chat_id=? AND image_hash=?
             ORDER BY id ASC LIMIT 1
         """, (chat_id, image_hash))
         row = cur.fetchone()
         if row:
-            return ("IMAGE", row)
+            prev_text_hash = row[3]
+            if prev_text_hash == text_hash:
+                return ("IMAGE", row)
 
     return None
 
