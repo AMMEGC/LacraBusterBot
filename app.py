@@ -2,7 +2,6 @@ import os
 import re
 import io
 import json
-import time
 import hashlib
 import logging
 import threading
@@ -28,12 +27,8 @@ OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 
 TZ_CDMX = ZoneInfo("America/Mexico_City")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("lacra")
-
 
 # =========================
 # Render dummy server
@@ -44,14 +39,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
-
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-
 # =========================
-# Helpers: time formatting
+# Time formatting
 # =========================
 _ES_MONTHS = {
     1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
@@ -59,15 +52,12 @@ _ES_MONTHS = {
 }
 
 def format_cdmx(dt_iso: str) -> str:
-    """dt_iso: ISO string in UTC (or with tz). Returns pretty CDMX string."""
     try:
         dt = datetime.fromisoformat(dt_iso.replace("Z", "+00:00"))
     except Exception:
         return dt_iso
-
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-
     local = dt.astimezone(TZ_CDMX)
     hour = local.hour
     ampm = "AM" if hour < 12 else "PM"
@@ -76,27 +66,21 @@ def format_cdmx(dt_iso: str) -> str:
         hour12 = 12
     return f"{local.day:02d} {_ES_MONTHS[local.month]} {local.year}, {hour12}:{local.minute:02d} {ampm} (CDMX)"
 
-
 # =========================
-# Image: ensure real JPEG + hashes
+# Image utilities
 # =========================
 def to_real_jpeg_bytes(image_bytes: bytes) -> bytes:
-    """
-    Telegram sometimes gives weird bytes; convert to real JPEG.
-    """
     with Image.open(io.BytesIO(image_bytes)) as im:
         im = im.convert("RGB")
         out = io.BytesIO()
         im.save(out, format="JPEG", quality=92, optimize=True)
         return out.getvalue()
 
-
 def compute_image_phash_hex(jpeg_bytes: bytes) -> str:
     with Image.open(io.BytesIO(jpeg_bytes)) as im:
         im = im.convert("RGB")
         h = imagehash.phash(im)
-        return str(h)  # hex string
-
+        return str(h)
 
 def phash_distance(hex_a: str, hex_b: str) -> int:
     try:
@@ -104,9 +88,8 @@ def phash_distance(hex_a: str, hex_b: str) -> int:
     except Exception:
         return 999
 
-
 # =========================
-# Text normalization + identity extraction
+# Text normalization
 # =========================
 def strip_accents(s: str) -> str:
     return "".join(
@@ -115,13 +98,6 @@ def strip_accents(s: str) -> str:
     )
 
 def normalize_text_for_hash(s: str) -> str:
-    """
-    Make OCR text stable for hashing:
-    - uppercase
-    - remove accents
-    - keep letters/numbers/basic punctuation as spaces
-    - collapse whitespace
-    """
     s = (s or "").upper()
     s = strip_accents(s)
     s = re.sub(r"[^A-Z0-9/\n ]+", " ", s)
@@ -132,92 +108,166 @@ def normalize_text_for_hash(s: str) -> str:
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
-CURP_RE = re.compile(r"\b[A-Z]{4}\d{6}[A-Z]{6}\d{2}\b")
-# CLAVE ELECTOR suele ser 18 alfanum (a veces 18 exacto, a veces 18+)
-CLAVE_ELECTOR_RE = re.compile(r"\b[A-Z0-9]{18}\b")
-DOB_RE = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")
-
-def extract_name_block(text_norm: str) -> str:
-    """
-    Extract likely name lines after 'NOMBRE'.
-    """
-    lines = [ln.strip() for ln in text_norm.splitlines() if ln.strip()]
-    name_lines = []
-    grab = False
-    for ln in lines:
-        if "NOMBRE" == ln or ln.startswith("NOMBRE "):
-            grab = True
-            continue
-        if grab:
-            # stop if hits another known field label
-            if any(k in ln for k in [
-                "DOMICILIO", "CURP", "CLAVE DE ELECTOR", "FECHA DE NACIMIENTO",
-                "SECCION", "VIGENCIA", "ANO DE REGISTRO", "SEXO"
-            ]):
-                break
-            # take up to 4 lines (AP + AM + NOMBRES suele ser 3)
-            if re.fullmatch(r"[A-Z ]{2,}", ln):
-                name_lines.append(ln)
-            if len(name_lines) >= 4:
-                break
-    # Join
-    return " ".join(name_lines).strip()
-
-def extract_identity(text_norm: str) -> dict:
-    curp = None
-    clave = None
-    dob = None
-
-    m = CURP_RE.search(text_norm)
-    if m:
-        curp = m.group(0)
-
-    # If there are many 18-char tokens, prefer the one near 'CLAVE DE ELECTOR'
-    if "CLAVE DE ELECTOR" in text_norm:
-        idx = text_norm.find("CLAVE DE ELECTOR")
-        window = text_norm[idx: idx + 250]
-        m2 = CLAVE_ELECTOR_RE.search(window)
-        if m2:
-            clave = m2.group(0)
-
-    if not clave:
-        m3 = CLAVE_ELECTOR_RE.search(text_norm)
-        if m3:
-            clave = m3.group(0)
-
-    m4 = DOB_RE.search(text_norm)
-    if m4:
-        dob = m4.group(0)
-
-    name = extract_name_block(text_norm)
-
-    # Person key priority: CURP > CLAVE ELECTOR > name+dob
-    person_key = None
-    person_key_type = None
-    if curp:
-        person_key = curp
-        person_key_type = "CURP"
-    elif clave:
-        person_key = clave
-        person_key_type = "CLAVE_ELECTOR"
-    elif name and dob:
-        person_key = sha256_hex(f"{name}|{dob}")[:24]
-        person_key_type = "NAME_DOB"
-
-    return {
-        "curp": curp,
-        "clave_elector": clave,
-        "dob": dob,
-        "name": name,
-        "person_key": person_key,
-        "person_key_type": person_key_type,
-    }
-
 def similarity_ratio(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
 
+# =========================
+# OCR regex basics
+# =========================
+CURP_RE = re.compile(r"\b[A-Z]{4}\d{6}[A-Z]{6}\d{2}\b")
+CLAVE_ELECTOR_RE = re.compile(r"\b[A-Z0-9]{18}\b")
+DOB_RE = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")
+
+LABELS = [
+    "DOMICILIO", "CLAVE DE ELECTOR", "CURP", "FECHA DE NACIMIENTO",
+    "SECCION", "VIGENCIA", "ANO DE REGISTRO", "SEXO", "NOMBRE"
+]
+
+def _is_label_line(ln: str) -> bool:
+    return any(ln == lab or ln.startswith(lab + " ") for lab in LABELS)
+
+def extract_block_after_label(text_norm: str, label: str, max_lines: int = 6) -> str:
+    lines = [ln.strip() for ln in text_norm.splitlines() if ln.strip()]
+    grab = False
+    out = []
+    for ln in lines:
+        if ln == label or ln.startswith(label + " "):
+            rest = ln[len(label):].strip()
+            if rest:
+                out.append(rest)
+            grab = True
+            continue
+        if grab:
+            if _is_label_line(ln):
+                break
+            if len(ln) >= 2:
+                out.append(ln)
+            if len(out) >= max_lines:
+                break
+    return "\n".join(out).strip()
+
+def extract_name_block_ine(text_norm: str) -> str:
+    block = extract_block_after_label(text_norm, "NOMBRE", max_lines=4)
+    cleaned = []
+    for ln in block.splitlines():
+        if re.fullmatch(r"[A-Z ]{2,}", ln):
+            cleaned.append(ln)
+    return " ".join(cleaned).strip()
+
+# =========================
+# Document profiles (Option 2)
+# =========================
+DOC_PROFILES = {
+    "INE_MX": {
+        "keywords": ["CREDENCIAL PARA VOTAR", "INSTITUTO NACIONAL ELECTORAL", "ELECTOR", "SECCION", "VIGENCIA", "INE"],
+        "id_fields_priority": ["curp", "clave_elector"],
+        "fields": {
+            "name": {"label": "NOMBRE", "max_lines": 4},
+            "domicilio": {"label": "DOMICILIO", "max_lines": 6},
+            "curp": {"regex": CURP_RE},
+            "clave_elector": {"label": "CLAVE DE ELECTOR", "regex": CLAVE_ELECTOR_RE},
+            "dob": {"label": "FECHA DE NACIMIENTO", "regex": DOB_RE},
+            "sexo": {"label": "SEXO", "max_lines": 1},
+            "seccion": {"label": "SECCION", "max_lines": 2},
+            "vigencia": {"label": "VIGENCIA", "max_lines": 2},
+            "ano_registro": {"label": "ANO DE REGISTRO", "max_lines": 2},
+        },
+        "diff_fields": ["domicilio", "vigencia", "seccion", "sexo", "ano_registro"],
+    },
+
+    "PASSPORT_MX": {
+        "keywords": ["PASAPORTE", "ESTADOS UNIDOS MEXICANOS", "MEXICO", "PASSPORT", "NATIONALITY", "NACIONALIDAD"],
+        "id_fields_priority": ["passport_no", "curp"],
+        "fields": {
+            # Pasaportes varían mucho; aquí lo más útil es número y fechas.
+            "passport_no": {"regex": re.compile(r"\b([A-Z]\d{7,9}|\d{8,10})\b")},
+            "dob": {"regex": re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{2}\s?[A-Z]{3}\s?\d{4})\b")},
+            "nationality": {"regex": re.compile(r"\b(MEXICANA|MEXICAN|MEXICO)\b")},
+            "name": {"regex": re.compile(r"\b[A-Z]{2,}\s+[A-Z]{2,}(\s+[A-Z]{2,})+\b")},
+            "sex": {"regex": re.compile(r"\b(M|F)\b")},
+            "expiry": {"regex": re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{2}\s?[A-Z]{3}\s?\d{4})\b")},
+        },
+        "diff_fields": ["passport_no", "expiry", "nationality"],
+    },
+
+    "LICENSE_MX": {
+        "keywords": ["LICENCIA", "CONDUCIR", "DRIVER", "VIGENCIA"],
+        "id_fields_priority": ["license_no", "curp"],
+        "fields": {
+            "name": {"label": "NOMBRE", "max_lines": 3},
+            "license_no": {"regex": re.compile(r"\b([A-Z0-9]{8,18})\b")},
+            "dob": {"regex": DOB_RE},
+            "expiry": {"regex": re.compile(r"\b(VIGENCIA|EXPIRA|EXPIRY)\b")},
+            "address": {"regex": re.compile(r"\b(DOMICILIO|DIRECCION|ADDRESS)\b")},
+        },
+        "diff_fields": ["license_no", "expiry", "address"],
+    },
+
+    "UNKNOWN": {
+        "keywords": [],
+        "id_fields_priority": [],
+        "fields": {},
+        "diff_fields": [],
+    }
+}
+
+def detect_doc_type(text_norm: str) -> str:
+    best = ("UNKNOWN", 0)
+    for dt, prof in DOC_PROFILES.items():
+        if dt == "UNKNOWN":
+            continue
+        hits = sum(1 for kw in prof["keywords"] if kw in text_norm)
+        if hits > best[1]:
+            best = (dt, hits)
+    return best[0] if best[1] > 0 else "UNKNOWN"
+
+def extract_by_profile(text_norm: str, doc_type: str) -> dict:
+    prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
+    out = {}
+
+    for field, spec in prof.get("fields", {}).items():
+        val = ""
+
+        # Special: INE name extraction is better with label block
+        if doc_type == "INE_MX" and field == "name":
+            val = extract_name_block_ine(text_norm)
+
+        if "label" in spec and not val:
+            val = extract_block_after_label(text_norm, spec["label"], max_lines=spec.get("max_lines", 4))
+
+        if "regex" in spec and not val:
+            rx = spec["regex"]
+            if "label" in spec and spec["label"] in text_norm:
+                idx = text_norm.find(spec["label"])
+                window = text_norm[idx: idx + 350]
+                m = rx.search(window)
+            else:
+                m = rx.search(text_norm)
+            if m:
+                val = m.group(0)
+
+        val = (val or "").strip()
+        if val:
+            out[field] = val
+
+    return out
+
+def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
+    prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
+    for k in prof.get("id_fields_priority", []):
+        v = (fields.get(k) or "").strip()
+        if v:
+            return v, f"{doc_type}:{k}"
+
+    # Fallback: name+dob
+    name = (fields.get("name") or "").strip()
+    dob = (fields.get("dob") or "").strip()
+    if name and dob:
+        return sha256_hex(f"{name}|{dob}")[:24], f"{doc_type}:NAME_DOB"
+
+    return "", ""
 
 # =========================
 # OCR.space
@@ -254,9 +304,8 @@ def ocr_space_bytes(jpeg_bytes: bytes) -> str:
 
     return (results[0].get("ParsedText") or "").strip()
 
-
 # =========================
-# DB: schema + safe migrations
+# DB schema + migrations
 # =========================
 def ensure_column(cur, table: str, column: str, ddl: str):
     cur.execute(f"PRAGMA table_info({table})")
@@ -270,7 +319,6 @@ def init_db():
     conn = sqlite3.connect(DBPATH)
     cur = conn.cursor()
 
-    # Main table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ocr_texts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,20 +331,18 @@ def init_db():
         )
     """)
 
-    # Add new columns safely
     ensure_column(cur, "ocr_texts", "ocr_status", "ocr_status TEXT")
     ensure_column(cur, "ocr_texts", "ocr_error", "ocr_error TEXT")
     ensure_column(cur, "ocr_texts", "image_hash", "image_hash TEXT")
     ensure_column(cur, "ocr_texts", "text_norm", "text_norm TEXT")
     ensure_column(cur, "ocr_texts", "text_hash", "text_hash TEXT")
+
+    ensure_column(cur, "ocr_texts", "doc_type", "doc_type TEXT")
+    ensure_column(cur, "ocr_texts", "fields_json", "fields_json TEXT")
+
     ensure_column(cur, "ocr_texts", "person_key", "person_key TEXT")
     ensure_column(cur, "ocr_texts", "person_key_type", "person_key_type TEXT")
-    ensure_column(cur, "ocr_texts", "name_extracted", "name_extracted TEXT")
-    ensure_column(cur, "ocr_texts", "curp", "curp TEXT")
-    ensure_column(cur, "ocr_texts", "clave_elector", "clave_elector TEXT")
-    ensure_column(cur, "ocr_texts", "dob", "dob TEXT")
 
-    # Indexes (only if columns exist)
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_chat_created ON ocr_texts(chat_id, created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ocr_texts_text_hash ON ocr_texts(text_hash)")
@@ -309,16 +355,13 @@ def init_db():
     conn.close()
     log.info("DB inicializada en: %s", DBPATH)
 
-
 def db_conn():
     return sqlite3.connect(DBPATH)
 
-
+# =========================
+# DB queries
+# =========================
 def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
-    """
-    Exact duplicate if same text_hash OR same image_hash.
-    Returns row or None.
-    """
     if text_hash:
         cur.execute("""
             SELECT id, created_at, message_id FROM ocr_texts
@@ -341,28 +384,31 @@ def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
 
     return None
 
-
-def find_same_person(cur, chat_id: int, person_key: str):
+def find_first_by_person(cur, chat_id: int, person_key: str):
     if not person_key:
         return None
     cur.execute("""
-        SELECT id, created_at, message_id, name_extracted, person_key_type
+        SELECT id, created_at, message_id, doc_type, person_key_type
         FROM ocr_texts
         WHERE chat_id=? AND person_key=?
         ORDER BY id ASC LIMIT 1
     """, (chat_id, person_key))
     return cur.fetchone()
 
-
-def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str, limit: int = 120):
-    """
-    Suggest possible matches based on:
-    - close image phash distance
-    - name similarity
-    Returns top 3 suggestions.
-    """
+def find_latest_by_person(cur, chat_id: int, person_key: str):
+    if not person_key:
+        return None
     cur.execute("""
-        SELECT id, created_at, message_id, image_hash, name_extracted, curp, clave_elector
+        SELECT id, created_at, message_id, doc_type, fields_json
+        FROM ocr_texts
+        WHERE chat_id=? AND person_key=?
+        ORDER BY id DESC LIMIT 1
+    """, (chat_id, person_key))
+    return cur.fetchone()
+
+def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str, limit: int = 150):
+    cur.execute("""
+        SELECT id, created_at, message_id, image_hash, doc_type, fields_json
         FROM ocr_texts
         WHERE chat_id=?
         ORDER BY id DESC
@@ -371,28 +417,31 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
     rows = cur.fetchall()
 
     scored = []
-    for (rid, created_at, msg_id, img_hash, name_prev, curp, clave) in rows:
+    for (rid, created_at, mid, img_hash, doc_type, fields_json) in rows:
         img_score = 0.0
         name_score = 0.0
 
+        # name from stored fields_json
+        try:
+            f = json.loads(fields_json) if fields_json else {}
+        except Exception:
+            f = {}
+        name_prev = (f.get("name") or "").strip()
+
         if image_hash_now and img_hash:
             d = phash_distance(image_hash_now, img_hash)
-            # distance 0..64-ish. Convert to 0..1 (rough)
-            img_score = max(0.0, 1.0 - (d / 14.0))  # <=14 still somewhat close
+            img_score = max(0.0, 1.0 - (d / 14.0))
 
         if name_now and name_prev:
             name_score = similarity_ratio(name_now, name_prev)
 
-        # Weighted combined
         combined = (0.6 * img_score) + (0.4 * name_score)
 
-        # keep if looks somewhat meaningful
-        if combined >= 0.72 or (img_score >= 0.82) or (name_score >= 0.88):
-            scored.append((combined, img_score, name_score, rid, created_at, msg_id, name_prev, curp, clave))
+        if combined >= 0.72 or img_score >= 0.82 or name_score >= 0.88:
+            scored.append((combined, img_score, name_score, rid, created_at, mid, doc_type, name_prev))
 
     scored.sort(reverse=True, key=lambda x: x[0])
     return scored[:3]
-
 
 def insert_record(
     chat_id: int,
@@ -406,7 +455,10 @@ def insert_record(
     image_hash: str,
     text_norm: str,
     text_hash: str,
-    ident: dict,
+    doc_type: str,
+    fields: dict,
+    person_key: str,
+    person_key_type: str,
 ):
     conn = db_conn()
     cur = conn.cursor()
@@ -415,27 +467,63 @@ def insert_record(
             chat_id, user_id, message_id, file_unique_id, created_at,
             ocr_text, ocr_status, ocr_error,
             image_hash, text_norm, text_hash,
-            person_key, person_key_type,
-            name_extracted, curp, clave_elector, dob
+            doc_type, fields_json,
+            person_key, person_key_type
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         chat_id, user_id, message_id, file_unique_id, created_at_iso,
         ocr_text, ocr_status, ocr_error,
         image_hash, text_norm, text_hash,
-        ident.get("person_key"), ident.get("person_key_type"),
-        ident.get("name"), ident.get("curp"), ident.get("clave_elector"), ident.get("dob")
+        doc_type, json.dumps(fields, ensure_ascii=False),
+        person_key, person_key_type
     ))
     conn.commit()
     conn.close()
 
+# =========================
+# Diff logic per profile
+# =========================
+def diff_fields_by_profile(doc_type: str, prev_fields: dict, now_fields: dict):
+    prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
+    keys = prof.get("diff_fields", [])
+
+    diffs = []
+    for k in keys:
+        a = (prev_fields.get(k) or "").strip()
+        b = (now_fields.get(k) or "").strip()
+        if a and b and a != b:
+            diffs.append((k, a, b))
+        elif a == "" and b != "":
+            diffs.append((k, "(vacío)", b))
+        elif a != "" and b == "":
+            diffs.append((k, a, "(vacío)"))
+    return diffs
+
+def pretty_label(k: str) -> str:
+    m = {
+        "domicilio": "🏠 Domicilio",
+        "vigencia": "📅 Vigencia",
+        "seccion": "🧩 Sección",
+        "sexo": "👤 Sexo",
+        "ano_registro": "🗓️ Año de registro",
+        "passport_no": "🛂 Pasaporte No.",
+        "expiry": "📅 Expira",
+        "nationality": "🌎 Nacionalidad",
+        "license_no": "🪪 Licencia No.",
+        "address": "🏠 Dirección",
+        "dob": "🎂 Nacimiento",
+        "name": "🧑 Nombre",
+        "clave_elector": "🧾 Clave elector",
+        "curp": "🧬 CURP",
+    }
+    return m.get(k, k)
 
 # =========================
 # Telegram handlers
 # =========================
 def start(update, context):
     update.message.reply_text("🤖 Bot activo. Mándame una foto.")
-
 
 def photo_received(update, context):
     msg = update.message
@@ -449,14 +537,12 @@ def photo_received(update, context):
     photo = msg.photo[-1]
     file_unique_id = photo.file_unique_id
 
-    log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s file_unique_id=%s",
-             chat_id, message_id, user_id, file_unique_id)
+    log.info("PHOTO_RECEIVED chat=%s msg=%s user=%s file_unique_id=%s", chat_id, message_id, user_id, file_unique_id)
 
-    # Download bytes
     tg_file = context.bot.get_file(photo.file_id)
     raw_bytes = tg_file.download_as_bytearray()
 
-    # Convert to real JPEG + image hash
+    # JPEG + pHash
     try:
         jpeg_bytes = to_real_jpeg_bytes(raw_bytes)
         img_hash = compute_image_phash_hex(jpeg_bytes)
@@ -478,71 +564,116 @@ def photo_received(update, context):
         ocr_error = str(e)
         log.warning("OCR error: %s", ocr_error)
 
-    # Normalize + hashes + identity
+    # Normalize + hashes
     text_norm = normalize_text_for_hash(ocr_text)
     text_hash = sha256_hex(text_norm) if text_norm else ""
-    ident = extract_identity(text_norm)
+
+    # Doc type + fields
+    doc_type = detect_doc_type(text_norm)
+    fields = extract_by_profile(text_norm, doc_type)
+
+    # Ensure INE pulls curp/clave/name better
+    if doc_type == "INE_MX":
+        if "name" not in fields:
+            fields["name"] = extract_name_block_ine(text_norm)
+        if "curp" not in fields:
+            m = CURP_RE.search(text_norm)
+            if m:
+                fields["curp"] = m.group(0)
+        if "clave_elector" not in fields:
+            if "CLAVE DE ELECTOR" in text_norm:
+                idx = text_norm.find("CLAVE DE ELECTOR")
+                window = text_norm[idx: idx + 350]
+                m2 = CLAVE_ELECTOR_RE.search(window)
+                if m2:
+                    fields["clave_elector"] = m2.group(0)
+            if "clave_elector" not in fields:
+                m3 = CLAVE_ELECTOR_RE.search(text_norm)
+                if m3:
+                    fields["clave_elector"] = m3.group(0)
+        if "dob" not in fields:
+            m4 = DOB_RE.search(text_norm)
+            if m4:
+                fields["dob"] = m4.group(0)
+
+    # person key (ID fuerte por perfil)
+    person_key, person_key_type = build_person_key(doc_type, fields)
 
     created_at_iso = datetime.now(timezone.utc).isoformat()
 
-    # DB checks
     conn = db_conn()
     cur = conn.cursor()
 
+    # 1) exact duplicates (text/image)
     exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
-    same_person = None
-    if ident.get("person_key"):
-        same_person = find_same_person(cur, chat_id, ident["person_key"])
 
-    # Close conn early, we will insert after decisions
+    # 2) same person by person_key
+    first_person = None
+    latest_person = None
+    if person_key:
+        first_person = find_first_by_person(cur, chat_id, person_key)
+        latest_person = find_latest_by_person(cur, chat_id, person_key)
+
+    # 3) fuzzy suggestions (optional)
+    name_now = (fields.get("name") or "").strip()
+    suggestions = []
+    if not first_person:  # only if no strong match
+        try:
+            suggestions = find_fuzzy_suggestions(cur, chat_id, name_now, img_hash)
+        except Exception as e:
+            log.warning("Fuzzy suggestion error: %s", e)
+
     conn.close()
 
-    # 1) Exact duplicate => no insert, reply with first seen
+    # If exact duplicate -> reply and do not insert
     if exact:
         kind, row = exact
-        _, first_seen_iso, first_msg_id = row
+        _, first_seen_iso, _first_mid = row
         when = format_cdmx(first_seen_iso)
         update.message.reply_text(
-            f"✅ Esa foto ya estaba registrada.\n"
+            f"✅ Ya estaba registrada.\n"
             f"🕒 Primera vez: {when}\n"
             f"🔎 Coincidencia: {'TEXTO' if kind=='TEXT' else 'IMAGEN'}"
         )
-        log.info("DUPLICATE exact (%s) ignored. first_seen=%s", kind, first_seen_iso)
         return
 
-    # 2) Not exact, but same person key => insert + reply as “relacionado”
-    # (CURP/Clave/NOMBRE+FECHA)
+    # If same person -> compute changes vs latest record
     person_note = ""
-    if same_person:
-        _, first_seen_iso, first_msg_id, prev_name, pk_type = same_person
-        when = format_cdmx(first_seen_iso)
-        person_note = (
-            f"\n🟡 Posible MISMA PERSONA ({pk_type}).\n"
-            f"🕒 Primera vez: {when}"
-        )
+    changes_note = ""
 
-    # 3) Fuzzy suggestions (optional) – only if no strong person key match
-    fuzzy_note = ""
-    if not same_person:
+    if first_person and latest_person:
+        _id1, first_seen_iso, _mid1, doc_first, pk_type = first_person
+        _idl, last_seen_iso, _midl, doc_last, prev_fields_json = latest_person
+
+        person_note = f"\n🟡 Misma persona detectada ({pk_type}).\n🕒 Primera vez: {format_cdmx(first_seen_iso)}"
+
         try:
-            conn = db_conn()
-            cur = conn.cursor()
-            suggestions = find_fuzzy_suggestions(cur, chat_id, ident.get("name") or "", img_hash)
-            conn.close()
-        except Exception as e:
-            suggestions = []
-            log.warning("Fuzzy suggestion error: %s", e)
+            prev_fields = json.loads(prev_fields_json) if prev_fields_json else {}
+        except Exception:
+            prev_fields = {}
 
-        if suggestions:
-            lines = []
-            for (combined, img_s, name_s, rid, created_at, mid, name_prev, curp, clave) in suggestions:
-                when = format_cdmx(created_at)
-                lines.append(
-                    f"• {int(combined*100)}% (img {int(img_s*100)}%, nombre {int(name_s*100)}%) — {when}"
-                )
-            fuzzy_note = "\n🟠 Sugerencias (no es seguro):\n" + "\n".join(lines)
+        # If doc_type changed between records, still compare using current doc_type rules (best effort)
+        diffs = diff_fields_by_profile(doc_type, prev_fields, fields)
 
-    # Insert new record
+        if diffs:
+            pretty = []
+            for k, a, b in diffs:
+                pretty.append(f"{pretty_label(k)}\nANTES:\n{a}\nAHORA:\n{b}")
+            changes_note = "\n\n🧾 Cambios detectados:\n\n" + "\n\n".join(pretty)
+        else:
+            # Sometimes OCR reads one field and not the other; say best-effort.
+            changes_note = "\n\n🧾 Sin cambios detectables (con lo que leyó el OCR)."
+
+    # Suggestions note
+    fuzzy_note = ""
+    if suggestions:
+        lines = []
+        for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev) in suggestions:
+            when = format_cdmx(created_at)
+            lines.append(f"• {int(combined*100)}% (img {int(img_s*100)}%, nombre {int(name_s*100)}%) — {when} — {dtyp}")
+        fuzzy_note = "\n\n🟠 Sugerencias (no seguro):\n" + "\n".join(lines)
+
+    # Insert record (always insert new if not exact duplicate)
     insert_record(
         chat_id=chat_id,
         user_id=user_id,
@@ -555,24 +686,25 @@ def photo_received(update, context):
         image_hash=img_hash,
         text_norm=text_norm,
         text_hash=text_hash,
-        ident=ident,
+        doc_type=doc_type,
+        fields=fields,
+        person_key=person_key,
+        person_key_type=person_key_type,
     )
 
-    # Reply: show OCR text if any
+    # Reply with OCR text and notes
     if ocr_status == "ok" and ocr_text.strip():
-        # limit message length (Telegram)
-        max_len = 3000
         shown = ocr_text.strip()
-        if len(shown) > max_len:
-            shown = shown[:max_len] + "\n…(recortado)"
+        if len(shown) > 2500:
+            shown = shown[:2500] + "\n…(recortado)"
         update.message.reply_text(
-            "📄 Texto detectado y guardado:\n\n" + shown + person_note + fuzzy_note
+            f"📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+            + person_note + changes_note + fuzzy_note
         )
     elif ocr_status == "empty":
-        update.message.reply_text("📸 Foto guardada (sin texto legible)." + person_note + fuzzy_note)
+        update.message.reply_text(f"📸 Foto guardada (sin texto legible) ({doc_type})." + person_note + changes_note + fuzzy_note)
     else:
-        update.message.reply_text("📸 Foto guardada, pero el OCR falló." + person_note + fuzzy_note)
-
+        update.message.reply_text(f"📸 Foto guardada, pero el OCR falló ({doc_type})." + person_note + changes_note + fuzzy_note)
 
 def main():
     if not BOT_TOKEN:
@@ -594,6 +726,6 @@ def main():
     updater.start_polling()
     updater.idle()
 
-
 if __name__ == "__main__":
     main()
+
