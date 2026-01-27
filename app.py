@@ -850,15 +850,11 @@ def error_handler(update, context):
     except Exception:
         pass
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN")
 
 def historial(update, context):
     msg = update.message
     chat_id = msg.chat_id
 
-    # /historial 15
     n = 10
     try:
         if context.args and context.args[0].isdigit():
@@ -890,7 +886,6 @@ def ver(update, context):
     msg = update.message
     chat_id = msg.chat_id
 
-    # /ver 123
     if not context.args or not context.args[0].isdigit():
         msg.reply_text("Uso: /ver <id>\nEj: /ver 12")
         return
@@ -926,7 +921,6 @@ def ver(update, context):
     if ocr_error:
         parts.append(f"⚠️ OCR error: {ocr_error}")
 
-    # Muestra campos detectados (sin soltar todo el OCR completo)
     if f:
         pretty = []
         for k, v in f.items():
@@ -943,7 +937,6 @@ def persona(update, context):
     msg = update.message
     chat_id = msg.chat_id
 
-    # /persona <CURP|CLAVE|PASAPORTE|person_key>
     if not context.args:
         msg.reply_text("Uso: /persona <identificador>\nEj: /persona GODE900101HDFXXX00 (CURP)")
         return
@@ -968,7 +961,6 @@ def persona(update, context):
         msg.reply_text("Encontré la llave de persona, pero no hay registros (raro).")
         return
 
-    # Primer y último (por la lista ya viene DESC)
     last = rows[0]
     first = rows[-1]
 
@@ -990,7 +982,12 @@ def persona(update, context):
         lines.append(f"• #{rid} — {format_cdmx(created_at)} — {dtyp}{nm_part}")
 
     msg.reply_text("\n".join(lines))
-    
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Falta BOT_TOKEN")
+
     init_db()
 
     t = threading.Thread(target=run_server, daemon=True)
@@ -1010,6 +1007,7 @@ def persona(update, context):
     log.info("Bot arrancando polling...")
     updater.start_polling()
     updater.idle()
+
 
 if __name__ == "__main__":
     main()
