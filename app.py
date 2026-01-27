@@ -461,6 +461,79 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
     scored.sort(reverse=True, key=lambda x: x[0])
     return scored[:3]
 
+def safe_json_loads(s: str) -> dict:
+    try:
+        return json.loads(s) if s else {}
+    except Exception:
+        return {}
+
+def get_last_records(cur, chat_id: int, limit: int = 10):
+    cur.execute("""
+        SELECT id, created_at, doc_type, fields_json, ocr_status
+        FROM ocr_texts
+        WHERE chat_id=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (chat_id, limit))
+    return cur.fetchall()
+
+def get_record_by_id(cur, chat_id: int, rid: int):
+    cur.execute("""
+        SELECT id, created_at, message_id, doc_type, ocr_status, ocr_error,
+               image_hash, text_hash, fields_json, person_key, person_key_type
+        FROM ocr_texts
+        WHERE chat_id=? AND id=?
+        LIMIT 1
+    """, (chat_id, rid))
+    return cur.fetchone()
+
+def get_person_records(cur, chat_id: int, person_key: str, limit: int = 30):
+    cur.execute("""
+        SELECT id, created_at, message_id, doc_type, fields_json
+        FROM ocr_texts
+        WHERE chat_id=? AND person_key=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (chat_id, person_key, limit))
+    return cur.fetchall()
+
+def find_person_key_by_identifier(cur, chat_id: int, token: str):
+    """
+    token puede ser:
+      - person_key directo (hash)
+      - CURP / CLAVE_ELECTOR / PASAPORTE etc. (porque tú guardas person_key = ese valor cuando existe)
+    """
+    t = (token or "").strip().upper()
+    if not t:
+        return None
+
+    # Primero: exact match en person_key (cuando person_key es CURP/CLAVE/PASAPORTE)
+    cur.execute("""
+        SELECT person_key, person_key_type, doc_type, created_at
+        FROM ocr_texts
+        WHERE chat_id=? AND person_key=?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (chat_id, t))
+    row = cur.fetchone()
+    if row:
+        return row  # (person_key, person_key_type, doc_type, created_at)
+
+    # Segundo: buscar dentro de fields_json (por si luego cambias lógica)
+    # Nota: LIKE es "barato" pero sirve. Para serio, luego metemos columnas indexadas.
+    cur.execute("""
+        SELECT person_key, person_key_type, doc_type, created_at, fields_json
+        FROM ocr_texts
+        WHERE chat_id=? AND fields_json LIKE ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (chat_id, f'%{t}%'))
+    row2 = cur.fetchone()
+    if row2 and row2[0]:
+        return (row2[0], row2[1], row2[2], row2[3])
+
+    return None
+
 def insert_record(
     chat_id: int,
     user_id: int,
@@ -781,6 +854,143 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN")
 
+def historial(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+
+    # /historial 15
+    n = 10
+    try:
+        if context.args and context.args[0].isdigit():
+            n = max(1, min(30, int(context.args[0])))
+    except Exception:
+        pass
+
+    conn = db_conn()
+    cur = conn.cursor()
+    rows = get_last_records(cur, chat_id, limit=n)
+    conn.close()
+
+    if not rows:
+        msg.reply_text("📭 No hay registros todavía en este chat.")
+        return
+
+    lines = [f"📚 Últimos {len(rows)} registros:"]
+    for (rid, created_at, doc_type, fields_json, ocr_status) in rows:
+        when = format_cdmx(created_at)
+        f = safe_json_loads(fields_json)
+        name = (f.get("name") or "").strip()
+        name_part = f" — 🧑 {name}" if name else ""
+        lines.append(f"• #{rid} — {when} — {doc_type} — OCR:{ocr_status}{name_part}")
+
+    msg.reply_text("\n".join(lines))
+
+
+def ver(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+
+    # /ver 123
+    if not context.args or not context.args[0].isdigit():
+        msg.reply_text("Uso: /ver <id>\nEj: /ver 12")
+        return
+
+    rid = int(context.args[0])
+
+    conn = db_conn()
+    cur = conn.cursor()
+    row = get_record_by_id(cur, chat_id, rid)
+    conn.close()
+
+    if not row:
+        msg.reply_text("No encontré ese ID en este chat.")
+        return
+
+    (rid, created_at, message_id, doc_type, ocr_status, ocr_error,
+     image_hash, text_hash, fields_json, person_key, person_key_type) = row
+
+    f = safe_json_loads(fields_json)
+    name = (f.get("name") or "").strip()
+
+    parts = [
+        f"🧾 Registro #{rid}",
+        f"🕒 {format_cdmx(created_at)}",
+        f"📄 Tipo: {doc_type}",
+        f"👤 Nombre: {name if name else '(no detectado)'}",
+        f"🔑 person_key: {person_key if person_key else '(vacío)'} ({person_key_type if person_key_type else '-'})",
+        f"🧠 OCR: {ocr_status}",
+        f"🧬 text_hash: {text_hash if text_hash else '(vacío)'}",
+        f"📸 image_hash: {image_hash if image_hash else '(vacío)'}",
+    ]
+
+    if ocr_error:
+        parts.append(f"⚠️ OCR error: {ocr_error}")
+
+    # Muestra campos detectados (sin soltar todo el OCR completo)
+    if f:
+        pretty = []
+        for k, v in f.items():
+            if not v:
+                continue
+            pretty.append(f"{pretty_label(k)}: {v}")
+        if pretty:
+            parts.append("\n📌 Campos:\n" + "\n".join(pretty))
+
+    msg.reply_text("\n".join(parts))
+
+
+def persona(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+
+    # /persona <CURP|CLAVE|PASAPORTE|person_key>
+    if not context.args:
+        msg.reply_text("Uso: /persona <identificador>\nEj: /persona GODE900101HDFXXX00 (CURP)")
+        return
+
+    token = " ".join(context.args).strip().upper()
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    pk_row = find_person_key_by_identifier(cur, chat_id, token)
+    if not pk_row:
+        conn.close()
+        msg.reply_text("No encontré a esa persona / identificador en este chat.")
+        return
+
+    person_key, person_key_type, doc_type, created_at = pk_row
+
+    rows = get_person_records(cur, chat_id, person_key, limit=30)
+    conn.close()
+
+    if not rows:
+        msg.reply_text("Encontré la llave de persona, pero no hay registros (raro).")
+        return
+
+    # Primer y último (por la lista ya viene DESC)
+    last = rows[0]
+    first = rows[-1]
+
+    def row_name(fields_json: str) -> str:
+        f = safe_json_loads(fields_json)
+        return (f.get("name") or "").strip()
+
+    lines = []
+    lines.append("🟡 Persona encontrada")
+    lines.append(f"🔑 person_key: {person_key} ({person_key_type})")
+    lines.append(f"📄 Tipo: {doc_type}")
+    lines.append(f"🕒 Primer registro: #{first[0]} — {format_cdmx(first[1])} — {first[3]} — 🧑 {row_name(first[4]) or '(sin nombre)'}")
+    lines.append(f"🕒 Último registro:  #{last[0]} — {format_cdmx(last[1])} — {last[3]} — 🧑 {row_name(last[4]) or '(sin nombre)'}")
+    lines.append("")
+    lines.append("📚 Registros recientes:")
+    for (rid, created_at, mid, dtyp, fields_json) in rows[:10]:
+        nm = row_name(fields_json)
+        nm_part = f" — 🧑 {nm}" if nm else ""
+        lines.append(f"• #{rid} — {format_cdmx(created_at)} — {dtyp}{nm_part}")
+
+    msg.reply_text("\n".join(lines))
+    
     init_db()
 
     t = threading.Thread(target=run_server, daemon=True)
@@ -790,6 +1000,10 @@ def main():
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("historial", historial))
+    dp.add_handler(CommandHandler("ver", ver))
+    dp.add_handler(CommandHandler("persona", persona))
+
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
     dp.add_error_handler(error_handler)
 
