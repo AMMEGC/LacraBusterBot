@@ -345,6 +345,23 @@ def init_db():
             ocr_text TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS person_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            person_key TEXT,
+            status_code INTEGER,
+            note TEXT,
+            tagged_at TEXT,
+            tagged_by_user_id INTEGER
+        )
+    """)
+
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_tags_unique ON person_tags(chat_id, person_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_tags_status ON person_tags(chat_id, status_code)")
+    except Exception as e:
+        log.warning("Index creation warning (person_tags): %s", e)
 
     ensure_column(cur, "ocr_texts", "ocr_status", "ocr_status TEXT")
     ensure_column(cur, "ocr_texts", "ocr_error", "ocr_error TEXT")
@@ -402,6 +419,35 @@ def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
                 return ("IMAGE", row)
 
     return None
+
+def upsert_person_tag(cur, chat_id: int, person_key: str, status_code: int, note: str, tagged_by_user_id: int):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO person_tags (chat_id, person_key, status_code, note, tagged_at, tagged_by_user_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, person_key)
+        DO UPDATE SET
+            status_code=excluded.status_code,
+            note=excluded.note,
+            tagged_at=excluded.tagged_at,
+            tagged_by_user_id=excluded.tagged_by_user_id
+    """, (chat_id, person_key, int(status_code), (note or "").strip(), now_iso, int(tagged_by_user_id)))
+
+
+def get_person_tag(cur, chat_id: int, person_key: str):
+    if not person_key:
+        return None
+    cur.execute("""
+        SELECT status_code, note, tagged_at, tagged_by_user_id
+        FROM person_tags
+        WHERE chat_id=? AND person_key=?
+        LIMIT 1
+    """, (chat_id, person_key))
+    return cur.fetchone()
+
+
+def delete_person_tag(cur, chat_id: int, person_key: str):
+    cur.execute("DELETE FROM person_tags WHERE chat_id=? AND person_key=?", (chat_id, person_key))
 
 def find_first_by_person(cur, chat_id: int, person_key: str):
     if not person_key:
@@ -569,8 +615,11 @@ def insert_record(
         doc_type, json.dumps(fields, ensure_ascii=False),
         person_key, person_key_type
     ))
+    rid = cur.lastrowid
     conn.commit()
     conn.close()
+    return rid
+
 
 # =========================
 # Diff logic
@@ -710,6 +759,17 @@ def photo_received(update, context):
 
         # person key (ID fuerte por perfil)
         person_key, person_key_type = build_person_key(doc_type, fields)
+        tag_alert = ""
+        if person_key:
+            conn = db_conn()
+            cur = conn.cursor()
+            tagrow = get_person_tag(cur, chat_id, person_key)
+            conn.close()
+
+            if tagrow:
+                status_code, note, tagged_at, tagged_by = tagrow
+                if int(status_code) == 110:
+                        tag_alert = "🚨 ALERTA: ESTA PERSONA ESTÁ MARCADA COMO 110\n" + (f"📝 {note}\n" if note else "")
 
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
@@ -797,7 +857,7 @@ def photo_received(update, context):
             fuzzy_note = "\n\n🟠 Sugerencias (no confirmadas):\n" + "\n".join(lines)
 
         # Insert record
-        insert_record(
+        rid = insert_record(
             chat_id=chat_id,
             user_id=user_id,
             message_id=message_id,
@@ -821,17 +881,17 @@ def photo_received(update, context):
             if len(shown) > 2500:
                 shown = shown[:2500] + "\n…(recortado)"
             update.message.reply_text(
-                f"📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                tag_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
                 + person_note + changes_note + fuzzy_note
             )
         elif ocr_status == "empty":
             update.message.reply_text(
-                f"📸 Foto guardada (sin texto legible) ({doc_type})."
+                tag_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
         else:
             update.message.reply_text(
-                f"📸 Foto guardada, pero el OCR falló ({doc_type})."
+                tag_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
 
@@ -983,6 +1043,71 @@ def persona(update, context):
 
     msg.reply_text("\n".join(lines))
 
+def tag(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id
+
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 ratero confirmado")
+        return
+
+    rid = int(context.args[0])
+    code = int(context.args[1])
+    note = " ".join(context.args[2:]).strip() if len(context.args) > 2 else ""
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    row = get_record_by_id(cur, chat_id, rid)
+    if not row:
+        conn.close()
+        msg.reply_text("No encontré ese ID en este chat.")
+        return
+
+    person_key = row[-2]  # tu get_record_by_id deja person_key como penúltimo
+    if not person_key:
+        conn.close()
+        msg.reply_text("Ese registro no tiene person_key (no pude identificar persona).")
+        return
+
+    upsert_person_tag(cur, chat_id, person_key, code, note, user_id)
+    conn.commit()
+    conn.close()
+
+    msg.reply_text(f"✅ Marcado como {code}.\n🔑 person_key: {person_key}" + (f"\n📝 Nota: {note}" if note else ""))
+
+
+def untag(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+
+    if not context.args or not context.args[0].isdigit():
+        msg.reply_text("Uso: /untag <id_registro>\nEj: /untag 12")
+        return
+
+    rid = int(context.args[0])
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    row = get_record_by_id(cur, chat_id, rid)
+    if not row:
+        conn.close()
+        msg.reply_text("No encontré ese ID en este chat.")
+        return
+
+    person_key = row[-2]
+    if not person_key:
+        conn.close()
+        msg.reply_text("Ese registro no tiene person_key.")
+        return
+
+    delete_person_tag(cur, chat_id, person_key)
+    conn.commit()
+    conn.close()
+
+    msg.reply_text(f"🧽 Marca eliminada.\n🔑 person_key: {person_key}")
 
 def main():
     if not BOT_TOKEN:
@@ -1000,6 +1125,8 @@ def main():
     dp.add_handler(CommandHandler("historial", historial))
     dp.add_handler(CommandHandler("ver", ver))
     dp.add_handler(CommandHandler("persona", persona))
+    dp.add_handler(CommandHandler("tag", tag))
+    dp.add_handler(CommandHandler("untag", untag))
 
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
     dp.add_error_handler(error_handler)
