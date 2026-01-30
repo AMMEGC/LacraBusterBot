@@ -469,6 +469,40 @@ def upsert_person_tag(cur, chat_id: int, person_key: str, status_code: int, note
             tagged_by_user_id=excluded.tagged_by_user_id
     """, (chat_id, person_key, int(status_code), (note or "").strip(), now_iso, int(tagged_by_user_id)))
 
+def find_tag110_by_name(cur, chat_id: int, name_now: str, min_score: float = 0.88):
+    """
+    Busca en TODO el histórico de tags=110 por nombre parecido.
+    Regresa el mejor match (score, rid, created_at, name_prev, note, tagged_at) o None.
+    """
+    if not name_now:
+        return None
+
+    cur.execute("""
+        SELECT t.status_code, t.note, t.tagged_at,
+               o.id, o.created_at, o.fields_json
+        FROM person_tags t
+        JOIN ocr_texts o ON o.person_key = t.person_key AND o.chat_id = t.chat_id
+        WHERE t.chat_id=? AND CAST(t.status_code AS INTEGER)=110
+        ORDER BY o.id DESC
+        LIMIT 600
+    """, (chat_id,))
+    rows = cur.fetchall()
+
+    best = None
+    name_now_u = (name_now or "").strip().upper()
+
+    for (status_code, note, tagged_at, rid, created_at, fields_json) in rows:
+        f = safe_json_loads(fields_json)
+        name_prev = (f.get("name") or "").strip()
+        if not name_prev:
+            continue
+
+        score = similarity_ratio(name_now_u, name_prev.upper())
+        if score >= min_score:
+            if (best is None) or (score > best[0]):
+                best = (score, rid, created_at, name_prev, note, tagged_at)
+
+    return best
 
 def get_person_tag(cur, chat_id: int, person_key: str):
     if not person_key:
@@ -989,6 +1023,23 @@ def photo_received(update, context):
                 if tag110 and note110:
                     lines.append(f"  📝 {note110}")
             fuzzy_note = "\n\n🟠 Sugerencias (no confirmadas):\n" + "\n".join(lines)
+            # Si no hubo tag110 en las sugerencias, buscar 110 por nombre en todo el histórico
+            if person_key and not any(s[8] for s in suggestions):
+                try:
+                    conn = db_conn()
+                    cur = conn.cursor()
+                    best110 = find_tag110_by_name(cur, chat_id, name_now, min_score=0.88)
+                    conn.close()
+
+                    if best110:
+                        score, rid, created_at, name_prev, note, tagged_at = best110
+                        tag_alert += (
+                            "\n🚨🚨 ALERTA 110 (POR NOMBRE EN HISTÓRICO) 🚨🚨\n"
+                            f"Coincidencia {int(score*100)}% con #{rid} — {format_cdmx(created_at)}\n"
+                            + (f"📝 {note}\n" if note else "")
+                        )
+                except Exception as e:
+                    log.warning("find_tag110_by_name error: %s", e)
 
         # Insert record
         rid = insert_record(
