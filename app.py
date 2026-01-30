@@ -509,7 +509,7 @@ def find_latest_by_person(cur, chat_id: int, person_key: str):
 
 def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str, limit: int = 150):
     cur.execute("""
-        SELECT id, created_at, message_id, image_hash, doc_type, fields_json
+        SELECT id, created_at, message_id, image_hash, doc_type, fields_json, person_key
         FROM ocr_texts
         WHERE chat_id=?
         ORDER BY id DESC
@@ -518,7 +518,7 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
     rows = cur.fetchall()
 
     scored = []
-    for (rid, created_at, mid, img_hash, doc_type, fields_json) in rows:
+    for (rid, created_at, mid, img_hash, doc_type, fields_json, person_key_prev) in rows:
         img_score = 0.0
         name_score = 0.0
 
@@ -528,20 +528,42 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
             f = {}
         name_prev = (f.get("name") or "").strip()
 
+        # score por foto (si hay)
         if image_hash_now and img_hash:
             d = phash_distance(image_hash_now, img_hash)
             img_score = max(0.0, 1.0 - (d / 14.0))
 
+        # score por nombre (si hay)
         if name_now and name_prev:
             name_score = similarity_ratio(name_now, name_prev)
 
         combined = (0.6 * img_score) + (0.4 * name_score)
 
+        # umbrales para sugerir
         if combined >= 0.72 or img_score >= 0.82 or name_score >= 0.88:
-            scored.append((combined, img_score, name_score, rid, created_at, mid, doc_type, name_prev))
+            # 👇 NUEVO: checar si ese registro sugerido está tagueado como 110
+            tag110 = False
+            note110 = ""
+            if person_key_prev:
+                tagrow = get_person_tag(cur, chat_id, person_key_prev)
+                if tagrow:
+                    status_code, note, tagged_at, tagged_by = tagrow
+                    try:
+                        if int(status_code) == 110:
+                            tag110 = True
+                            note110 = (note or "").strip()
+                    except Exception:
+                        pass
 
-    scored.sort(reverse=True, key=lambda x: x[0])
+            scored.append((
+                combined, img_score, name_score,
+                rid, created_at, mid, doc_type, name_prev,
+                tag110, note110
+            ))
+
+    scored.sort(reverse=True, key=lambda x: (1 if x[8] else 0, x[0]))
     return scored[:3]
+
 
 def safe_json_loads(s: str) -> dict:
     try:
@@ -943,7 +965,7 @@ def photo_received(update, context):
         fuzzy_note = ""
         if suggestions:
             lines = []
-            for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev) in suggestions:
+            for (combined, img_s, name_s, rid, created_at, mid, dtyp, name_prev, tag110, note110) in suggestions:
                 when = format_cdmx(created_at)
 
                 parts = []
@@ -957,8 +979,15 @@ def photo_received(update, context):
                 else:
                     parts.append("🧑 nombre no detectado / no comparable")
 
-                lines.append(f"• Posible match — {', '.join(parts)}\n  🕒 {when} — {dtyp}")
+                alert = ""
+                if tag110:
+                    alert = " 🚨110"
 
+                lines.append(f"• Posible match{alert} — {', '.join(parts)}\n"
+                             f"  🕒 {when} — {dtyp}"
+                )
+                if tag110 and note110:
+                    lines.append(f"  📝 {note110}")
             fuzzy_note = "\n\n🟠 Sugerencias (no confirmadas):\n" + "\n".join(lines)
 
         # Insert record
