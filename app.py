@@ -320,6 +320,16 @@ def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
 
     return "", ""
 
+def build_name_key(fields: dict) -> str:
+    name = (fields.get("name") or "").strip()
+    if not name:
+        return ""
+    # Normaliza igual que tu OCR (mayúsculas, sin acentos, espacios)
+    name_norm = normalize_text_for_hash(name).replace("\n", " ").strip()
+    if not name_norm:
+        return ""
+    return "NAMEONLY:" + sha256_hex(name_norm)[:24]
+
 # =========================
 # OCR.space
 # =========================
@@ -890,6 +900,11 @@ def photo_received(update, context):
 
         # person key (ID fuerte por perfil)
         person_key, person_key_type = build_person_key(doc_type, fields)
+        if not person_key:
+            nk = build_name_key(fields)
+            if nk:
+                person_key = nk
+                person_key_type = f"{doc_type}:NAMEONLY"
         tag_alert = ""
         if person_key:
             conn = db_conn()
@@ -1232,6 +1247,10 @@ def tag(update, context):
     msg = update.message
     chat_id = msg.chat_id
     user_id = msg.from_user.id
+    
+    if not person_key:
+    msg.reply_text("Ese registro no tiene person_key ni nombre suficiente para identificar persona.")
+    return
 
     if len(context.args) < 2 or not context.args[0].isdigit():
         msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 ratero confirmado")
