@@ -113,6 +113,42 @@ def similarity_ratio(a: str, b: str) -> float:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
 
+def normalize_name_for_match(name: str) -> str:
+    s = (name or "").upper()
+    s = strip_accents(s)
+    s = re.sub(r"[^A-Z ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def name_tokens(name: str) -> list[str]:
+    s = normalize_name_for_match(name)
+    if not s:
+        return []
+    toks = [t for t in s.split(" ") if len(t) >= 2]
+    # quita palabras súper comunes si quieres (opcional)
+    stop = {"DE", "DEL", "LA", "LAS", "LOS", "Y"}
+    toks = [t for t in toks if t not in stop]
+    return toks
+
+def name_similarity(a: str, b: str) -> float:
+    # Similaridad robusta a orden de apellidos/nombres:
+    ta = name_tokens(a)
+    tb = name_tokens(b)
+    if not ta or not tb:
+        return 0.0
+
+    # Jaccard (intersección/union) + bonus por secuencia parecida
+    sa, sb = set(ta), set(tb)
+    j = len(sa & sb) / max(1, len(sa | sb))
+
+    # compara también string ordenado por tokens para tolerar orden distinto
+    a2 = " ".join(sorted(ta))
+    b2 = " ".join(sorted(tb))
+    seq = similarity_ratio(a2, b2)
+
+    return 0.65 * j + 0.35 * seq
+
+
 # =========================
 # OCR regex basics
 # =========================
@@ -580,6 +616,45 @@ def find_person_key_by_identifier(cur, chat_id: int, token: str):
 
     return None
 
+def get_all_names(cur, chat_id: int, limit: int = 2000):
+    cur.execute("""
+        SELECT id, created_at, person_key, person_key_type, fields_json
+        FROM ocr_texts
+        WHERE chat_id=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (chat_id, limit))
+    return cur.fetchall()
+
+def find_name_matches_with_tags(cur, chat_id: int, name_now: str, threshold: float = 0.86, limit: int = 2000):
+    rows = get_all_names(cur, chat_id, limit=limit)
+
+    matches = []
+    best_110 = None
+
+    for (rid, created_at, person_key, pk_type, fields_json) in rows:
+        f = safe_json_loads(fields_json)
+        name_prev = (f.get("name") or "").strip()
+        if not name_prev:
+            continue
+
+        score = name_similarity(name_now, name_prev)
+        if score >= threshold:
+            # si tiene person_key, revisa si está tagueado como 110
+            tag = None
+            if person_key:
+                tag = get_person_tag(cur, chat_id, person_key)
+
+            matches.append((score, rid, created_at, name_prev, person_key, tag))
+
+            if tag:
+                status_code, note, tagged_at, tagged_by = tag
+                if int(status_code) == 110 and best_110 is None:
+                    best_110 = (score, rid, created_at, name_prev, note, tagged_at)
+
+    matches.sort(reverse=True, key=lambda x: x[0])
+    return matches[:3], best_110
+
 def insert_record(
     chat_id: int,
     user_id: int,
@@ -789,6 +864,32 @@ def photo_received(update, context):
             latest_person = find_latest_by_person(cur, chat_id, person_key)
 
         name_now = (fields.get("name") or "").strip()
+        # 🔎 Match automático por nombre (histórico completo)
+        name_alert = ""
+        if name_now:
+            # OJO: aquí ya tienes `cur` abierto más abajo; pero en este punto aún no.
+            # Abrimos una conexión pequeña y la cerramos.
+            connN = db_conn()
+            curN = connN.cursor()
+            matches, best_110 = find_name_matches_with_tags(curN, chat_id, name_now, threshold=0.86, limit=2000)
+            connN.close()
+
+            if best_110:
+                score, rid, created_at, name_prev, note, tagged_at = best_110
+                name_alert = (
+                    "🚨🚨 ALERTA POR NOMBRE 🚨🚨\n"
+                    f"Coincidencia {int(score*100)}% con #{rid} — {format_cdmx(created_at)}\n"
+                    + (f"📝 {note}\n" if note else "")
+                )
+            elif matches:
+                # solo sugerencia sin 110
+                top = matches[0]
+                score, rid, created_at, name_prev, person_key_prev, tag = top
+                name_alert = (
+                    "🟠 POSIBLE MATCH POR NOMBRE\n"
+                    f"{int(score*100)}% con #{rid} — {format_cdmx(created_at)}\n"
+                )
+
         suggestions = []
         if not first_person:
             try:
@@ -885,17 +986,17 @@ def photo_received(update, context):
             if len(shown) > 2500:
                 shown = shown[:2500] + "\n…(recortado)"
             update.message.reply_text(
-                tag_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                tag_alert + name_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
                 + person_note + changes_note + fuzzy_note
             )
         elif ocr_status == "empty":
             update.message.reply_text(
-                tag_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
+                tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
         else:
             update.message.reply_text(
-                tag_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
+                tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
 
