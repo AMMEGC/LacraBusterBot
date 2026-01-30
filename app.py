@@ -155,6 +155,7 @@ def name_similarity(a: str, b: str) -> float:
 CURP_RE = re.compile(r"\b[A-Z]{4}\d{6}[A-Z]{6}\d{2}\b")
 CLAVE_ELECTOR_RE = re.compile(r"\b[A-Z0-9]{18}\b")
 DOB_RE = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")
+RFC_RE = re.compile(r"\b[A-Z&]{3,4}\d{6}[A-Z0-9]{3}\b")
 
 LABELS = [
     "DOMICILIO", "CLAVE DE ELECTOR", "CURP", "FECHA DE NACIMIENTO",
@@ -198,7 +199,7 @@ def extract_name_block_ine(text_norm: str) -> str:
 DOC_PROFILES = {
     "INE_MX": {
         "keywords": ["CREDENCIAL PARA VOTAR", "INSTITUTO NACIONAL ELECTORAL", "ELECTOR", "SECCION", "VIGENCIA", "INE"],
-        "id_fields_priority": ["curp", "clave_elector"],
+        "id_fields_priority": ["curp", "rfc", "clave_elector"],
         "fields": {
             "name": {"label": "NOMBRE", "max_lines": 4},
             "domicilio": {"label": "DOMICILIO", "max_lines": 6},
@@ -209,6 +210,7 @@ DOC_PROFILES = {
             "seccion": {"label": "SECCION", "max_lines": 2},
             "vigencia": {"label": "VIGENCIA", "max_lines": 2},
             "ano_registro": {"label": "ANO DE REGISTRO", "max_lines": 2},
+            "rfc": {"regex": RFC_RE},
         },
         "diff_fields": ["domicilio", "vigencia", "seccion", "sexo", "ano_registro"],
     },
@@ -329,6 +331,38 @@ def build_name_key(fields: dict) -> str:
     if not name_norm:
         return ""
     return "NAMEONLY:" + sha256_hex(name_norm)[:24]
+
+def collect_person_keys(doc_type: str, fields: dict) -> list[str]:
+    """
+    Regresa todas las llaves posibles para identificar a la persona.
+    Esto sirve para que el 110 no dependa de una sola cosa (clave elector, etc.).
+    """
+    keys = []
+    # Identificadores fuertes
+    for k in ("curp", "rfc", "clave_elector", "passport_no", "license_no"):
+        v = (fields.get(k) or "").strip().upper()
+        if v:
+            keys.append(v)
+
+    # NAME + DOB (más estable que solo nombre)
+    name = (fields.get("name") or "").strip()
+    dob = (fields.get("dob") or "").strip()
+    if name and dob:
+        keys.append(sha256_hex(f"{normalize_text_for_hash(name)}|{dob}")[:24])
+
+    # NAMEONLY (último recurso)
+    nk = build_name_key(fields)
+    if nk:
+        keys.append(nk)
+
+    # Quita duplicados conservando orden
+    out = []
+    seen = set()
+    for x in keys:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 # =========================
 # OCR.space
@@ -906,20 +940,36 @@ def photo_received(update, context):
                 person_key = nk
                 person_key_type = f"{doc_type}:NAMEONLY"
         tag_alert = ""
-        if person_key:
-            conn = db_conn()
-            cur = conn.cursor()
-            tagrow = get_person_tag(cur, chat_id, person_key)
-            conn.close()
+        person_keys_all = collect_person_keys(doc_type, fields)
 
-            if tagrow:
-                status_code, note, tagged_at, tagged_by = tagrow
-                if int(status_code) == 110:
-                    tag_alert = (
-                        "🚨🚨 ALERTA 🚨🚨\n"
-                        "ESTA PERSONA ESTÁ MARCADA COMO 110\n"
-                        + (f"📝 {note}\n" if note else "")
-                    )
+        if person_keys_all:
+            connT = db_conn()
+            curT = connT.cursor()
+
+            tagrow_found = None
+            found_key = ""
+
+            for k in person_keys_all:
+                tr = get_person_tag(curT, chat_id, k)
+                if tr:
+                    try:
+                        if int(tr[0]) == 110:
+                            tagrow_found = tr
+                            found_key = k
+                            break
+                    except Exception:
+                        pass
+
+            connT.close()
+
+            if tagrow_found:
+                status_code, note, tagged_at, tagged_by = tagrow_found
+                tag_alert = (
+                    "🚨🚨 ALERTA 🚨🚨\n"
+                    "ESTA PERSONA ESTÁ MARCADA COMO 110\n"
+                    f"🔑 Match por llave: {found_key}\n"
+                    + (f"📝 {note}\n" if note else "")
+                )
 
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
@@ -1276,17 +1326,29 @@ def tag(update, context):
         msg.reply_text("No encontré ese ID en este chat.")
         return
 
-    person_key = row[-2]  # tu get_record_by_id deja person_key como penúltimo
-    if not person_key:
+    # Saca doc_type y fields_json del registro para generar todas las llaves
+    doc_type = row[3]
+    fields_json = row[8]
+    fields = safe_json_loads(fields_json)
+
+    keys_all = collect_person_keys(doc_type, fields)
+    if not keys_all:
         conn.close()
-        msg.reply_text("Ese registro no tiene person_key (no pude identificar persona).")
+        msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave, ni nombre).")
         return
 
-    upsert_person_tag(cur, chat_id, person_key, code, note, user_id)
+    for k in keys_all:
+        upsert_person_tag(cur, chat_id, k, code, note, user_id)
+
     conn.commit()
     conn.close()
 
-    msg.reply_text(f"✅ Marcado como {code}.\n🔑 person_key: {person_key}" + (f"\n📝 Nota: {note}" if note else ""))
+    msg.reply_text(
+        f"✅ Marcado como {code} en {len(keys_all)} llaves.\n"
+        f"🔑 Llave principal: {keys_all[0]}"
+        + (f"\n📝 Nota: {note}" if note else "")
+    )
+
 
 
 def untag(update, context):
