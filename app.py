@@ -769,7 +769,11 @@ def photo_received(update, context):
             if tagrow:
                 status_code, note, tagged_at, tagged_by = tagrow
                 if int(status_code) == 110:
-                        tag_alert = "🚨 ALERTA: ESTA PERSONA ESTÁ MARCADA COMO 110\n" + (f"📝 {note}\n" if note else "")
+                    tag_alert = (
+                        "🚨🚨 ALERTA 🚨🚨\n"
+                        "ESTA PERSONA ESTÁ MARCADA COMO 110\n"
+                        + (f"📝 {note}\n" if note else "")
+                    )
 
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
@@ -1053,7 +1057,14 @@ def tag(update, context):
         return
 
     rid = int(context.args[0])
-    code = int(context.args[1])
+    # Permite /tag <id> 110 ...  (normal)
+    # y también evita crash si se equivocan
+    try:
+        code = int(context.args[1])
+    except Exception:
+        msg.reply_text("Uso correcto: /tag <id_registro> <codigo-numero> [nota]\nEj: /tag 483 110 ratero confirmado")
+        return
+
     note = " ".join(context.args[2:]).strip() if len(context.args) > 2 else ""
 
     conn = db_conn()
