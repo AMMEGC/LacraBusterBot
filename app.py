@@ -1074,6 +1074,9 @@ def photo_received(update, context):
         if not guard_chat_enabled(update):
             log.info("GUARD BLOCKED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
             return
+        update.message.reply_text("⏳ Procesando foto...", parse_mode=None)
+        log.info("STEP 1: ack enviado")
+
         else:
             log.info("GUARD ALLOWED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
 
@@ -1098,6 +1101,7 @@ def photo_received(update, context):
         tg_file = context.bot.get_file(photo.file_id)
         raw_bytes = tg_file.download_as_bytearray()
         raw_bytes = bytes(raw_bytes)
+        log.info("STEP 2: foto descargada bytes=%s", len(raw_bytes))
 
         # JPEG + pHash
         try:
@@ -1120,6 +1124,7 @@ def photo_received(update, context):
             ocr_status = "error"
             ocr_error = str(e)
             log.warning("OCR error: %s", ocr_error)
+            log.info("STEP 3: OCR status=%s chars=%s", ocr_status, len(ocr_text or ""))
 
         # Normalize + hashes
         text_norm = normalize_text_for_hash(ocr_text)
@@ -1434,33 +1439,61 @@ def photo_received(update, context):
             person_key=person_key,
             person_key_type=person_key_type,
         )
+            log.info("STEP 4: a punto de responder (ocr_status=%s doc_type=%s)", ocr_status, doc_type)
 
-        # Reply
-        if ocr_status == "ok" and ocr_text.strip():
-            shown = ocr_text.strip()
-            if len(shown) > 2500:
-                shown = shown[:2500] + "\n…(recortado)"
-            update.message.reply_text(
-                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
-                + person_note + changes_note + fuzzy_note
-            )
-        elif ocr_status == "empty":
-            update.message.reply_text(
-                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
-                + person_note + changes_note + fuzzy_note
-            )
-        else:
-            update.message.reply_text(
-                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
-                + person_note + changes_note + fuzzy_note
-            )
+            # Reply
+            if ocr_status == "ok" and ocr_text.strip():
+                shown = ocr_text.strip()
+                if len(shown) > 2500:
+                    shown = shown[:2500] + "\n…(recortado)"
 
-    except Exception:
-        log.exception("Error en photo_received")
-        try:
-            update.message.reply_text("⚠️ Se cayó algo procesando tu foto. Revisa logs en Render.")
-        except Exception:
-            pass
+                try:
+                    update.message.reply_text(
+                        best110_alert + tag_alert + name_alert
+                        + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                        + person_note + changes_note + fuzzy_note,
+                        parse_mode=None
+                    )
+                    log.info("STEP 5: respuesta enviada OK")
+                except Exception:
+                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta OK")
+                    update.message.reply_text(
+                        "⚠️ Procesé la foto, pero falló el envío del mensaje.",
+                        parse_mode=None
+                    )
+
+            elif ocr_status == "empty":
+                try:
+                    update.message.reply_text(
+                        best110_alert + tag_alert + name_alert
+                        + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
+                        + person_note + changes_note + fuzzy_note,
+                        parse_mode=None
+                    )
+                    log.info("STEP 5: respuesta enviada EMPTY")
+                except Exception:
+                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta EMPTY")
+                    update.message.reply_text(
+                        "⚠️ Procesé la foto (sin texto legible), pero falló el envío del mensaje.",
+                        parse_mode=None
+                    )
+
+            else:
+                try:
+                    update.message.reply_text(
+                        best110_alert + tag_alert + name_alert
+                        + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
+                        + person_note + changes_note + fuzzy_note,
+                        parse_mode=None
+                    )
+                    log.info("STEP 5: respuesta enviada ERROR")
+                except Exception:
+                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta ERROR")
+                    update.message.reply_text(
+                        "⚠️ Guardé la foto, pero falló el envío del mensaje.",
+                        parse_mode=None
+                    )
+
 
 def error_handler(update, context):
     log.exception("Unhandled exception:", exc_info=context.error)
