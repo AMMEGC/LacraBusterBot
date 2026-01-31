@@ -1077,6 +1077,13 @@ def photo_received(update, context):
         chat_id = msg.chat_id
         user_id = msg.from_user.id
         message_id = msg.message_id
+        # ✅ Inicialización “anti-crashes” (para que NUNCA truene por variables no definidas)
+        person_key = ""
+        person_key_type = ""
+        name110 = ""
+        name_now = ""
+        doc_type = "UNKNOWN"
+        fields = {}
 
         photo = msg.photo[-1]
         file_unique_id = photo.file_unique_id
@@ -1116,6 +1123,9 @@ def photo_received(update, context):
         # Doc type + fields
         doc_type = detect_doc_type(text_norm)
         fields = extract_by_profile(text_norm, doc_type)
+        # ✅ Inicializar SIEMPRE (evita UnboundLocalError)
+        person_key = ""
+        person_key_type = ""
 
         # Ensure INE pulls curp/clave/name better
         if doc_type == "INE_MX":
