@@ -1072,6 +1072,11 @@ def photo_received(update, context):
             return
 
         if not guard_chat_enabled(update):
+            log.info("GUARD BLOCKED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
+            return
+        else:
+            log.info("GUARD ALLOWED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
+
             return
 
         chat_id = msg.chat_id
