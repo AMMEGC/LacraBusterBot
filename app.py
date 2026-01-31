@@ -25,6 +25,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 
+ADMIN_USER_IDS = set(
+    int(x) for x in (os.environ.get("ADMIN_USER_IDS", "").split(",") if os.environ.get("ADMIN_USER_IDS") else [])
+    if str(x).strip().isdigit()
+)
+
 TZ_CDMX = ZoneInfo("America/Mexico_City")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -509,6 +514,14 @@ def init_db():
             updated_at TEXT
         )
     """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS allowed_chats (
+            chat_id INTEGER PRIMARY KEY,
+            enabled INTEGER,
+            label TEXT,
+            updated_at TEXT
+        )
+    """)
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_aliases_unique ON person_aliases(chat_id, alias_key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(chat_id, canonical_key)")
@@ -553,6 +566,33 @@ def db_conn():
 # =========================
 # DB queries
 # =========================
+
+def is_chat_enabled(cur, chat_id: int) -> bool:
+    cur.execute("SELECT enabled FROM allowed_chats WHERE chat_id=? LIMIT 1", (int(chat_id),))
+    row = cur.fetchone()
+    return bool(row and int(row[0]) == 1)
+
+def set_chat_enabled(cur, chat_id: int, enabled: int, label: str = ""):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO allowed_chats (chat_id, enabled, label, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id)
+        DO UPDATE SET
+            enabled=excluded.enabled,
+            label=excluded.label,
+            updated_at=excluded.updated_at
+    """, (int(chat_id), int(enabled), (label or "").strip(), now_iso))
+
+def list_allowed_chats(cur):
+    cur.execute("""
+        SELECT chat_id, enabled, label, updated_at
+        FROM allowed_chats
+        ORDER BY updated_at DESC
+        LIMIT 50
+    """)
+    return cur.fetchall()
+    
 def find_exact_duplicate(cur, chat_id: int, text_hash: str, image_hash: str):
     if text_hash:
         cur.execute("""
@@ -1010,9 +1050,27 @@ def pretty_label(k: str) -> str:
 def start(update, context):
     update.message.reply_text("🤖 Bot activo. Mándame una foto.")
 
+def guard_chat_enabled(update) -> bool:
+    msg = getattr(update, "message", None)
+    if not msg:
+        return False
+
+    # Admin siempre puede usar /allowchat /blockchat etc.
+    if _is_admin(update):
+        return True
+
+    conn = db_conn()
+    cur = conn.cursor()
+    ok = is_chat_enabled(cur, msg.chat_id)
+    conn.close()
+    return ok
+
 def photo_received(update, context):
     try:
         msg = update.message
+        if not guard_chat_enabled(update):
+            return
+
         if not msg or not msg.photo:
             return
 
@@ -1391,6 +1449,9 @@ def error_handler(update, context):
 
 def historial(update, context):
     msg = update.message
+    if not guard_chat_enabled(update):
+    return
+
     chat_id = msg.chat_id
 
     n = 10
@@ -1422,6 +1483,8 @@ def historial(update, context):
 
 def ver(update, context):
     msg = update.message
+    if not guard_chat_enabled(update):
+        return
     chat_id = msg.chat_id
 
     if not context.args or not context.args[0].isdigit():
@@ -1473,6 +1536,8 @@ def ver(update, context):
 
 def persona(update, context):
     msg = update.message
+    if not guard_chat_enabled(update):
+        return
     chat_id = msg.chat_id
 
     if not context.args:
@@ -1523,6 +1588,8 @@ def persona(update, context):
 
 def tag(update, context):
     msg = update.message
+    if not guard_chat_enabled(update):
+        return   
     chat_id = msg.chat_id
     user_id = msg.from_user.id
     
@@ -1597,6 +1664,8 @@ def quick_tag_command(update, context):
     - Si no responden: taggea el ÚLTIMO registro del chat.
     """
     msg = update.message
+     if not guard_chat_enabled(update):
+        return
     if not msg:
         return
 
@@ -1699,6 +1768,8 @@ def quick_tag_command(update, context):
 
 def untag(update, context):
     msg = update.message
+    if not guard_chat_enabled(update):
+        return
     chat_id = msg.chat_id
 
     if not context.args or not context.args[0].isdigit():
@@ -1771,6 +1842,29 @@ def reset_chat(update, context):
 
     msg.reply_text("🧹 Reset listo: borré registros, tags y aliases de ESTE chat.")
 
+def myid(update, context):
+    msg = update.message
+    msg.reply_text(f"🆔 Tu user_id: {msg.from_user.id}\n🆔 chat_id aquí: {msg.chat_id}")
+
+def adminhelp(update, context):
+    if not _is_admin(update):
+        return
+
+    update.message.reply_text(
+        "🛡️ *Admin Help*\n\n"
+        "📌 Identificadores\n"
+        "• /myid  → ver tu user_id y el chat_id actual\n"
+        "• /chatid → ver solo chat_id\n\n"
+        "✅ Control de chats (no memorices IDs)\n"
+        "• /allowchat Producción  → autoriza ESTE chat y le pone etiqueta\n"
+        "• /allowchat Pruebas     → autoriza ESTE chat (etiqueta opcional)\n"
+        "• /blockchat             → bloquea ESTE chat\n"
+        "• /listchats             → lista los chats registrados (ON/OFF)\n\n"
+        "🧹 Limpieza de pruebas\n"
+        "• /reset → borra registros/tags del chat actual\n"
+        , parse_mode="Markdown"
+    )
+
 def help_cmd(update, context):
     update.message.reply_text(
         "🤖 *Ayuda rápida*\n\n"
@@ -1790,6 +1884,62 @@ def help_cmd(update, context):
         "Siempre que puedas, *responde a la foto* antes de usar `/110`."
     , parse_mode="Markdown")
 
+def _is_admin(update) -> bool:
+    try:
+        uid = update.message.from_user.id
+        return (not ADMIN_USER_IDS) or (int(uid) in ADMIN_USER_IDS)
+    except Exception:
+        return False
+
+def chatid(update, context):
+    msg = update.message
+    msg.reply_text(f"🆔 chat_id: {msg.chat_id}")
+
+def allowchat(update, context):
+    msg = update.message
+    if not _is_admin(update):
+        return
+
+    label = " ".join(context.args).strip() if context.args else ""
+    conn = db_conn()
+    cur = conn.cursor()
+    set_chat_enabled(cur, msg.chat_id, 1, label=label)
+    conn.commit()
+    conn.close()
+    msg.reply_text("✅ Este chat quedó AUTORIZADO para usar el bot.")
+
+def blockchat(update, context):
+    msg = update.message
+    if not _is_admin(update):
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    set_chat_enabled(cur, msg.chat_id, 0, label="")
+    conn.commit()
+    conn.close()
+    msg.reply_text("⛔ Este chat quedó BLOQUEADO. El bot ya no responderá aquí.")
+
+def listchats(update, context):
+    msg = update.message
+    if not _is_admin(update):
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    rows = list_allowed_chats(cur)
+    conn.close()
+
+    if not rows:
+        msg.reply_text("No hay chats registrados en allowed_chats todavía.")
+        return
+
+    lines = ["📋 Chats registrados:"]
+    for chat_id, enabled, label, updated_at in rows:
+        st = "✅ ON" if int(enabled) == 1 else "⛔ OFF"
+        lab = f" — {label}" if label else ""
+        lines.append(f"{st} — {chat_id}{lab} — {format_cdmx(updated_at)}")
+    msg.reply_text("\n".join(lines))
 
 def main():
     if not BOT_TOKEN:
@@ -1810,6 +1960,14 @@ def main():
     dp.add_handler(CommandHandler("tag", tag))
     dp.add_handler(CommandHandler("untag", untag))
     dp.add_handler(CommandHandler("110", quick_tag_command))
+    dp.add_handler(CommandHandler("chatid", chatid))
+    dp.add_handler(CommandHandler("allowchat", allowchat))
+    dp.add_handler(CommandHandler("blockchat", blockchat))
+    dp.add_handler(CommandHandler("listchats", listchats))
+    dp.add_handler(CommandHandler("myid", myid))
+    dp.add_handler(CommandHandler("adminhelp", adminhelp))
+
+
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("reset", reset_chat))
 
