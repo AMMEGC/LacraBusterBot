@@ -1438,60 +1438,35 @@ def photo_received(update, context):
             person_key=person_key,
             person_key_type=person_key_type,
         )
-            
-        log.info("STEP 4: a punto de responder (ocr_status=%s doc_type=%s)", ocr_status, doc_type)
-            # Reply
-            if ocr_status == "ok" and ocr_text.strip():
-                shown = ocr_text.strip()
-                if len(shown) > 2500:
-                    shown = shown[:2500] + "\n…(recortado)"
 
-                try:
-                    update.message.reply_text(
-                        best110_alert + tag_alert + name_alert
-                        + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
-                        + person_note + changes_note + fuzzy_note,
-                        parse_mode=None
-                    )
-                    log.info("STEP 5: respuesta enviada OK")
-                except Exception:
-                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta OK")
-                    update.message.reply_text(
-                        "⚠️ Procesé la foto, pero falló el envío del mensaje.",
-                        parse_mode=None
-                    )
+        # Reply
+        if ocr_status == "ok" and ocr_text.strip():
+            shown = ocr_text.strip()
+            if len(shown) > 2500:
+                shown = shown[:2500] + "\n…(recortado)"
 
-            elif ocr_status == "empty":
-                try:
-                    update.message.reply_text(
-                        best110_alert + tag_alert + name_alert
-                        + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
-                        + person_note + changes_note + fuzzy_note,
-                        parse_mode=None
-                    )
-                    log.info("STEP 5: respuesta enviada EMPTY")
-                except Exception:
-                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta EMPTY")
-                    update.message.reply_text(
-                        "⚠️ Procesé la foto (sin texto legible), pero falló el envío del mensaje.",
-                        parse_mode=None
-                    )
+            msg.reply_text(
+                best110_alert + tag_alert + name_alert
+                + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                + person_note + changes_note + fuzzy_note,
+                parse_mode=None
+            )
 
-            else:
-                try:
-                    update.message.reply_text(
-                        best110_alert + tag_alert + name_alert
-                        + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
-                        + person_note + changes_note + fuzzy_note,
-                        parse_mode=None
-                    )
-                    log.info("STEP 5: respuesta enviada ERROR")
-                except Exception:
-                    log.exception("STEP 5 FAIL: no se pudo enviar respuesta ERROR")
-                    update.message.reply_text(
-                        "⚠️ Guardé la foto, pero falló el envío del mensaje.",
-                        parse_mode=None
-                    )
+        elif ocr_status == "empty":
+            msg.reply_text(
+                best110_alert + tag_alert + name_alert
+                + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
+                + person_note + changes_note + fuzzy_note,
+                parse_mode=None
+            )
+
+        else:
+            msg.reply_text(
+                best110_alert + tag_alert + name_alert
+                + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
+                + person_note + changes_note + fuzzy_note,
+                parse_mode=None
+            )
 
 
 def error_handler(update, context):
