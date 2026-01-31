@@ -1886,7 +1886,7 @@ def adminhelp(update, context):
         "• /listchats             → lista los chats registrados (ON/OFF)\n\n"
         "🧹 Limpieza de pruebas\n"
         "• /reset → borra registros/tags del chat actual\n"
-        , parse_mode="Markdown"
+        , parse_mode=None
     )
 
 def help_cmd(update, context):
