@@ -996,10 +996,14 @@ def photo_received(update, context):
             if tagrow_found:
                 status_code, note, tagged_at, tagged_by = tagrow_found
                 tag_alert = (
-                    "🚨🚨 ALERTA 🚨🚨\n"
-                    "ESTA PERSONA ESTÁ MARCADA COMO 110\n"
+                    "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n"
+                    "🚨        ALERTA MÁXIMA 110        🚨\n"
+                    "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n"
+                    "🟥🟥🟥  ESTA PERSONA ESTÁ MARCADA COMO 110  🟥🟥🟥\n"
+                    "🛑 NO ENTREGAR VEHÍCULO 🛑\n"
                     f"🔑 Match por llave: {found_key}\n"
-                    + (f"📝 {note}\n" if note else "")
+                    + (f"📝 Nota: {note}\n" if note else "")
+                    + "🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨\n"
                 )
 
 
