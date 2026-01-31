@@ -284,7 +284,7 @@ DOC_PROFILES = {
 }
 
 def detect_doc_type(text_norm: str) -> str:
-    # Heurística fuerte para INE aunque falten keywords exactas
+    # Heurística fuerte para INE
     ine_signals = 0
     if "CREDENCIAL PARA VOTAR" in text_norm:
         ine_signals += 2
@@ -301,8 +301,9 @@ def detect_doc_type(text_norm: str) -> str:
 
     if ine_signals >= 4:
         return "INE_MX"
-        # Heurística fuerte para LICENCIA (Edomex/CDMX suelen traer "LICENCIA PARA CONDUCIR"
-        lic_signals = 0
+
+    # Heurística fuerte para LICENCIA
+    lic_signals = 0
     if "LICENCIA PARA CONDUCIR" in text_norm:
         lic_signals += 3
     if "NUMERO DE LICENCIA" in text_norm:
@@ -313,17 +314,19 @@ def detect_doc_type(text_norm: str) -> str:
         lic_signals += 1
     if "NOMBRE(S)" in text_norm:
         lic_signals += 1
-    # muchos OCR meten "CREDENCIAL PARA VOTAR" etc; aquí solo buscamos señales de licencia
+
     if lic_signals >= 4:
         return "LICENSE_MX"
-    # Heurística fuerte para PASAPORTE (MRZ suele traer P<)
+
+    # Heurística fuerte para PASAPORTE
     pass_signals = 0
     if "P<" in text_norm:
-        pass_signals += 3
+        pass_signals += 2
     if "PASAPORTE" in text_norm or "PASSPORT" in text_norm:
         pass_signals += 2
     if "NATIONALITY" in text_norm:
         pass_signals += 1
+
     if pass_signals >= 3:
         return "PASSPORT_MX"
 
@@ -1058,7 +1061,10 @@ def photo_received(update, context):
                 name_now = " ".join([ln.strip() for ln in m.group(1).splitlines() if ln.strip()])
                 # 🚨 Prioridad: buscar 110 por nombre (aunque haya match normal con otro registro)
         best110_alert = ""
-        if name_now:
+        name_clean = normalize_name_for_match(name_now) if name_now else ""
+        name_parts = [p for p in name_clean.split() if p]
+
+        if len(name_parts) >= 2:
             connH = db_conn()
             curH = connH.cursor()
             best110 = find_best_110_by_name(curH, chat_id, name_now, min_score=0.80, limit=3000)
@@ -1462,10 +1468,14 @@ def tag(update, context):
     
     # ✅ SIEMPRE agregar 110 por nombre (aunque haya CURP/clave/licencia/pasaporte/etc.)
     name_now = (fields.get("name") or "").strip()
-    name110 = build_name_110_key(name_now)
-    if name110 and name110 not in keys_all:
-        keys_all.append(name110)
 
+    name_clean = normalize_name_for_match(name_now) if name_now else ""
+    name_parts = [p for p in name_clean.split() if p]
+
+    if len(name_parts) >= 2:
+        name110 = build_name_110_key(name_now)
+        if name110 and name110 not in keys_all:
+            keys_all.append(name110)
 
     if not keys_all:
         conn.close()
