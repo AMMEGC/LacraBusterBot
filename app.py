@@ -1742,6 +1742,35 @@ def untag(update, context):
 
         msg.reply_text(f"🧽 Marca eliminada en {len(keys_all)} llaves.\n🔑 Ejemplo: {keys_all[0]}")
 
+def reset_chat(update, context):
+    msg = update.message
+    if not msg:
+        return
+
+    # Solo admin
+    if not _is_admin(update):
+        return
+
+    chat_id = msg.chat_id
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    # Borra historial OCR y tags de ESTE chat
+    cur.execute("DELETE FROM ocr_texts WHERE chat_id=?", (int(chat_id),))
+    cur.execute("DELETE FROM person_tags WHERE chat_id=?", (int(chat_id),))
+
+    # Si ya tienes aliases, también los borra (no pasa nada si no existe la tabla)
+    try:
+        cur.execute("DELETE FROM person_aliases WHERE chat_id=?", (int(chat_id),))
+    except Exception:
+        pass
+
+    conn.commit()
+    conn.close()
+
+    msg.reply_text("🧹 Reset listo: borré registros, tags y aliases de ESTE chat.")
+
 def help_cmd(update, context):
     update.message.reply_text(
         "🤖 *Ayuda rápida*\n\n"
@@ -1782,6 +1811,7 @@ def main():
     dp.add_handler(CommandHandler("untag", untag))
     dp.add_handler(CommandHandler("110", quick_tag_command))
     dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("reset", reset_chat))
 
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
     dp.add_error_handler(error_handler)
