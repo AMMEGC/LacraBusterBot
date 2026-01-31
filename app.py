@@ -1744,16 +1744,22 @@ def untag(update, context):
 
 def help_cmd(update, context):
     update.message.reply_text(
-        "📌 Comandos disponibles:\n"
-        "/start — activar bot\n"
-        "/historial [n] — últimos registros\n"
-        "/ver <id> — ver un registro\n"
-        "/persona <CURP/clave/etc> — ver historial de una persona\n"
-        "/tag <id> <codigo> [nota] — marcar por comando (admin)\n"
-        "/untag <id> — quitar marca\n"
-        "/110 [nota] — tag rápido al último registro (o al que respondas)\n\n"
-        "Tip: responde (reply) a la foto y escribe /110 para marcar esa exacta."
-    )
+        "🤖 *Ayuda rápida*\n\n"
+        "📸 *Flujo normal*\n"
+        "1️⃣ Manda una foto (INE / licencia / pasaporte)\n"
+        "2️⃣ El bot la registra y revisa historial\n"
+        "3️⃣ Si ves algo raro → márcalo\n\n"
+        "🚨 *Marcar como 110 (rápido)*\n"
+        "• `/110` → marca el *último* registro\n"
+        "• Responde a la foto + `/110` → marca *esa* foto\n"
+        "• `/110 nota opcional`\n\n"
+        "🛠️ *Comandos útiles*\n"
+        "• `/historial` → últimos registros\n"
+        "• `/ver <id>` → ver un registro\n"
+        "• `/persona <CURP/clave>` → ver historial de una persona\n\n"
+        "⚠️ *Tip importante*\n"
+        "Siempre que puedas, *responde a la foto* antes de usar `/110`."
+    , parse_mode="Markdown")
 
 
 def main():
