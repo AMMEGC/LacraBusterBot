@@ -199,6 +199,30 @@ def extract_name_block_ine(text_norm: str) -> str:
             cleaned.append(ln)
     return " ".join(cleaned).strip()
 
+def extract_name_from_license(text_norm: str) -> str:
+    """
+    Licencia EdoMex/CDMX suele venir como:
+    APELLIDO PATERNO
+    GARCIA
+    APELLIDO MATERNO
+    VALDEZ
+    NOMBRE(S)
+    GUSTAVO
+    """
+    def grab_after(label: str) -> str:
+        block = extract_block_after_label(text_norm, label, max_lines=1)
+        block = (block or "").strip()
+        if re.fullmatch(r"[A-Z ]{2,}", block):
+            return block
+        return ""
+
+    ap = grab_after("APELLIDO PATERNO")
+    am = grab_after("APELLIDO MATERNO")
+    nom = grab_after("NOMBRE(S)")
+    parts = [p for p in [ap, am, nom] if p]
+    return " ".join(parts).strip()
+
+
 # =========================
 # Document profiles
 # =========================
@@ -239,11 +263,12 @@ DOC_PROFILES = {
         "keywords": ["LICENCIA", "CONDUCIR", "DRIVER", "VIGENCIA"],
         "id_fields_priority": ["license_no", "curp"],
         "fields": {
-            "name": {"label": "NOMBRE", "max_lines": 3},
+            # Nombre: en licencias casi nunca viene como "NOMBRE" limpio, viene por apellidos + nombres
+            "name": {"label": "NOMBRE", "max_lines": 3},  # lo dejamos por compatibilidad
+            "curp": {"regex": CURP_RE},                   # ✅ CLAVE para unir con INE
             "license_no": {"regex": re.compile(r"\b([A-Z0-9]{8,18})\b")},
             "dob": {"regex": DOB_RE},
             "expiry": {"regex": re.compile(r"\b(VIGENCIA|EXPIRA|EXPIRY)\b")},
-            "address": {"regex": re.compile(r"\b(DOMICILIO|DIRECCION|ADDRESS)\b")},
         },
         "diff_fields": ["license_no", "expiry", "address"],
     },
@@ -293,6 +318,9 @@ def extract_by_profile(text_norm: str, doc_type: str) -> dict:
 
         if doc_type == "INE_MX" and field == "name":
             val = extract_name_block_ine(text_norm)
+
+        if doc_type == "LICENSE_MX" and field == "name":
+            val = extract_name_from_license(text_norm)
 
         if "label" in spec and not val:
             val = extract_block_after_label(text_norm, spec["label"], max_lines=spec.get("max_lines", 4))
