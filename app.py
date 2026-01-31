@@ -1437,7 +1437,7 @@ def photo_received(update, context):
             fields=fields,
             person_key=person_key,
             person_key_type=person_key_type,
-                )
+            )
             log.info("STEP 4: a punto de responder (ocr_status=%s doc_type=%s)", ocr_status, doc_type)
 
             # Reply
