@@ -1320,8 +1320,8 @@ def tag(update, context):
     user_id = msg.from_user.id
     
     if not person_key:
-    msg.reply_text("Ese registro no tiene person_key ni nombre suficiente para identificar persona.")
-    return
+        msg.reply_text("Ese registro no tiene person_key ni nombre suficiente para identificar persona.")
+        return
 
     if len(context.args) < 2 or not context.args[0].isdigit():
         msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 ratero confirmado")
