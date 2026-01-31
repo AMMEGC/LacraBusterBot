@@ -1080,8 +1080,6 @@ def photo_received(update, context):
         update.message.reply_text("⏳ Procesando foto...", parse_mode=None)
         log.info("STEP 1: ack enviado")
 
-            return
-
         chat_id = msg.chat_id
         user_id = msg.from_user.id
         message_id = msg.message_id
