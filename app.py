@@ -1664,7 +1664,7 @@ def quick_tag_command(update, context):
     - Si no responden: taggea el ÚLTIMO registro del chat.
     """
     msg = update.message
-     if not guard_chat_enabled(update):
+    if not guard_chat_enabled(update):
         return
     if not msg:
         return
