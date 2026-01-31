@@ -1965,6 +1965,27 @@ def listchats(update, context):
         lines.append(f"{st} — {chat_id}{lab} — {format_cdmx(updated_at)}")
     msg.reply_text("\n".join(lines))
 
+def chatstatus(update, context):
+    msg = update.message
+    if not _is_admin(update):
+        return
+
+    chat_id = msg.chat_id
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT enabled, label, updated_at FROM allowed_chats WHERE chat_id=? LIMIT 1", (int(chat_id),))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        msg.reply_text("ℹ️ Este chat NO está en allowed_chats (modo híbrido puede dejarlo pasar).")
+        return
+
+    enabled, label, updated_at = row
+    state = "✅ ENABLED" if int(enabled) == 1 else "⛔ BLOQUEADO"
+    msg.reply_text(f"📌 Estado chat: {state}\n🏷️ Label: {label or '-'}\n🕒 Updated: {format_cdmx(updated_at)}")
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN")
@@ -1987,6 +2008,7 @@ def main():
     dp.add_handler(CommandHandler("chatid", chatid))
     dp.add_handler(CommandHandler("allowchat", allowchat))
     dp.add_handler(CommandHandler("blockchat", blockchat))
+    dp.add_handler(CommandHandler("chatstatus", chatstatus))
     dp.add_handler(CommandHandler("listchats", listchats))
     dp.add_handler(CommandHandler("myid", myid))
     dp.add_handler(CommandHandler("adminhelp", adminhelp))
