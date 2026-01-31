@@ -1175,6 +1175,13 @@ def photo_received(update, context):
         conn = db_conn()
         cur = conn.cursor()
 
+        name110 = ""
+        name_now = (fields.get("name") or "").strip()
+        name_clean = normalize_name_for_match(name_now) if name_now else ""
+        name_parts = [p for p in name_clean.split() if p]
+        if len(name_parts) >= 2:
+            name110 = build_name_110_key(name_now)
+
                 # Guardar alias NAME110 -> canonical cuando exista una llave fuerte (CURP/RFC/CLAVE/etc.)
         # Esto ayuda a que licencias (solo nombre) se unan con INE (CURP) en el futuro.
         if name110:
@@ -1232,10 +1239,12 @@ def photo_received(update, context):
                 )
 
         tag_alert = ""
+        name110 = ""
+
         person_keys_all = collect_person_keys(doc_type, fields)
         # ✅ incluir llave 110 por nombre
         name110 = build_name_110_key(name_now)
-        if name110:
+        if name110 and name110 not in person_keys_all:
             person_keys_all.append(name110)
 
         if person_keys_all:
