@@ -1467,7 +1467,14 @@ def photo_received(update, context):
                 + person_note + changes_note + fuzzy_note,
                 parse_mode=None
             )
-
+            
+    except Exception as e:
+        log.exception("photo_received crashed: %s", e)
+        try:
+            if update and getattr(update, "message", None):
+                update.message.reply_text("⚠️ Error procesando la foto. Ya quedó en logs.")
+        except Exception:
+            pass
 
 def error_handler(update, context):
     log.exception("Unhandled exception:", exc_info=context.error)
