@@ -514,7 +514,7 @@ def init_db():
             updated_at TEXT
         )
     """)
-        cur.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS allowed_chats (
             chat_id INTEGER PRIMARY KEY,
             enabled INTEGER,
