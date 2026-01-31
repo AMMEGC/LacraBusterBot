@@ -1074,8 +1074,9 @@ def photo_received(update, context):
         if not guard_chat_enabled(update):
             log.info("GUARD BLOCKED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
             return
-        else:
-            log.info("GUARD ALLOWED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
+
+        log.info("GUARD ALLOWED photo chat=%s user=%s", msg.chat_id, msg.from_user.id)
+
 
         update.message.reply_text("⏳ Procesando foto...", parse_mode=None)
         log.info("STEP 1: ack enviado")
@@ -1436,7 +1437,7 @@ def photo_received(update, context):
             fields=fields,
             person_key=person_key,
             person_key_type=person_key_type,
-        )
+                )
             log.info("STEP 4: a punto de responder (ocr_status=%s doc_type=%s)", ocr_status, doc_type)
 
             # Reply
