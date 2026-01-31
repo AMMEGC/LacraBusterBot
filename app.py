@@ -1318,22 +1318,17 @@ def tag(update, context):
     msg = update.message
     chat_id = msg.chat_id
     user_id = msg.from_user.id
-    
-    if not person_key:
-        msg.reply_text("Ese registro no tiene person_key ni nombre suficiente para identificar persona.")
-        return
 
     if len(context.args) < 2 or not context.args[0].isdigit():
-        msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 ratero confirmado")
+        msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 rata confirmada")
         return
 
     rid = int(context.args[0])
-    # Permite /tag <id> 110 ...  (normal)
-    # y también evita crash si se equivocan
+
     try:
         code = int(context.args[1])
     except Exception:
-        msg.reply_text("Uso correcto: /tag <id_registro> <codigo-numero> [nota]\nEj: /tag 483 110 ratero confirmado")
+        msg.reply_text("Uso correcto: /tag <id_registro> <codigo-numero> [nota]\nEj: /tag 483 110 rata confirmada")
         return
 
     note = " ".join(context.args[2:]).strip() if len(context.args) > 2 else ""
@@ -1347,22 +1342,23 @@ def tag(update, context):
         msg.reply_text("No encontré ese ID en este chat.")
         return
 
-    # Saca doc_type y fields_json del registro para generar todas las llaves
+    # row layout: (..., fields_json, person_key, person_key_type)
     doc_type = row[3]
     fields_json = row[8]
     fields = safe_json_loads(fields_json)
 
     keys_all = collect_person_keys(doc_type, fields)
+
+    # Si no hay llaves fuertes, intenta guardar 110 por nombre
     if not keys_all:
-        # ✅ también guardar 110 por nombre (para que no dependa de CURP/clave)
         name_now = (fields.get("name") or "").strip()
         name110 = build_name_110_key(name_now)
         if name110:
             keys_all.append(name110)
-            
+
     if not keys_all:
         conn.close()
-        msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave, ni nombre).")
+        msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave/licencia, ni nombre).")
         return
 
     for k in keys_all:
@@ -1373,7 +1369,7 @@ def tag(update, context):
 
     msg.reply_text(
         f"✅ Marcado como {code} en {len(keys_all)} llaves.\n"
-        f"🔑 Llave principal: {keys_all[0]}"
+        f"🔑 Ejemplo: {keys_all[0]}"
         + (f"\n📝 Nota: {note}" if note else "")
     )
 
