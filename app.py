@@ -1358,8 +1358,9 @@ def tag(update, context):
         name_now = (fields.get("name") or "").strip()
         name110 = build_name_110_key(name_now)
         if name110:
+            keys_all.append(name110)
             
-    keys_all.append(name110)
+    if not keys_all:
         conn.close()
         msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave, ni nombre).")
         return
