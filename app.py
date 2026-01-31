@@ -1068,10 +1068,10 @@ def guard_chat_enabled(update) -> bool:
 def photo_received(update, context):
     try:
         msg = update.message
-        if not guard_chat_enabled(update):
+        if not msg or not msg.photo:
             return
 
-        if not msg or not msg.photo:
+        if not guard_chat_enabled(update):
             return
 
         chat_id = msg.chat_id
