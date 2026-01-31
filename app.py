@@ -618,7 +618,7 @@ def find_fuzzy_suggestions(cur, chat_id: int, name_now: str, image_hash_now: str
         combined = (0.6 * img_score) + (0.4 * name_score)
 
         # umbrales para sugerir
-        if combined >= 0.72 or img_score >= 0.82 or name_score >= 0.88:
+        if combined >= 0.62 or img_score >= 0.75 or name_score >= 0.92:
             # 👇 NUEVO: checar si ese registro sugerido está tagueado como 110
             tag110 = False
             note110 = ""
@@ -985,6 +985,12 @@ def photo_received(update, context):
             latest_person = find_latest_by_person(cur, chat_id, person_key)
 
         name_now = (fields.get("name") or "").strip()
+        # Fallback: si no se extrajo nombre por fields, intenta sacarlo del OCR completo
+        if not name_now:
+            m = re.search(r"\bNOMBRE\b\s+([A-Z ]{2,}\n[A-Z ]{2,}(?:\n[A-Z ]{2,}){0,2})", text_norm)
+            if m:
+                name_now = " ".join([ln.strip() for ln in m.group(1).splitlines() if ln.strip()])
+
         # 🔎 Match automático por nombre (histórico completo)
         name_alert = ""
         if name_now:
@@ -992,7 +998,7 @@ def photo_received(update, context):
             # Abrimos una conexión pequeña y la cerramos.
             connN = db_conn()
             curN = connN.cursor()
-            matches, best_110 = find_name_matches_with_tags(curN, chat_id, name_now, threshold=0.86, limit=2000)
+            matches, best_110 = find_name_matches_with_tags(curN, chat_id, name_now, threshold=0.92, limit=2000)
             connN.close()
 
             if best_110:
@@ -1012,11 +1018,10 @@ def photo_received(update, context):
                 )
 
         suggestions = []
-        if not first_person:
-            try:
-                suggestions = find_fuzzy_suggestions(cur, chat_id, name_now, img_hash)
-            except Exception as e:
-                log.warning("Fuzzy suggestion error: %s", e)
+        try:
+            suggestions = find_fuzzy_suggestions(cur, chat_id, name_now, img_hash)
+        except Exception as e:
+            log.warning("Fuzzy suggestion error: %s", e)
 
         conn.close()
 
