@@ -246,7 +246,7 @@ DOC_PROFILES = {
     },
 
     "PASSPORT_MX": {
-        "keywords": ["PASAPORTE", "ESTADOS UNIDOS MEXICANOS", "MEXICO", "PASSPORT", "NATIONALITY", "NACIONALIDAD"],
+        "keywords": ["PASAPORTE", "ESTADOS UNIDOS MEXICANOS", "MEXICO", "PASSPORT", "NATIONALITY", "DATE OF ISSUE", "DATE OF EXPIRY", "NACIONALIDAD"],
         "id_fields_priority": ["passport_no", "curp"],
         "fields": {
             "passport_no": {"regex": re.compile(r"\b([A-Z]\d{7,9}|\d{8,10})\b")},
@@ -255,12 +255,14 @@ DOC_PROFILES = {
             "name": {"regex": re.compile(r"\b[A-Z]{2,}\s+[A-Z]{2,}(\s+[A-Z]{2,})+\b")},
             "sex": {"regex": re.compile(r"\b(M|F)\b")},
             "expiry": {"regex": re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{2}\s?[A-Z]{3}\s?\d{4})\b")},
+            "curp": {"regex": CURP_RE},
+            "rfc": {"regex": RFC_RE},   # si ya lo tienes definido
         },
         "diff_fields": ["passport_no", "expiry", "nationality"],
     },
 
     "LICENSE_MX": {
-        "keywords": ["LICENCIA", "CONDUCIR", "DRIVER", "VIGENCIA"],
+        "keywords": ["LICENCIA", "CONDUCIR", "DRIVER", "VIGENCIA", "TIPO", "LICENSE"],
         "id_fields_priority": ["license_no", "curp"],
         "fields": {
             # Nombre: en licencias casi nunca viene como "NOMBRE" limpio, viene por apellidos + nombres
@@ -299,6 +301,31 @@ def detect_doc_type(text_norm: str) -> str:
 
     if ine_signals >= 4:
         return "INE_MX"
+        # Heurística fuerte para LICENCIA (Edomex/CDMX suelen traer "LICENCIA PARA CONDUCIR"
+        lic_signals = 0
+    if "LICENCIA PARA CONDUCIR" in text_norm:
+        lic_signals += 3
+    if "NUMERO DE LICENCIA" in text_norm:
+        lic_signals += 2
+    if "APELLIDO PATERNO" in text_norm:
+        lic_signals += 1
+    if "APELLIDO MATERNO" in text_norm:
+        lic_signals += 1
+    if "NOMBRE(S)" in text_norm:
+        lic_signals += 1
+    # muchos OCR meten "CREDENCIAL PARA VOTAR" etc; aquí solo buscamos señales de licencia
+    if lic_signals >= 4:
+        return "LICENSE_MX"
+    # Heurística fuerte para PASAPORTE (MRZ suele traer P<)
+    pass_signals = 0
+    if "P<" in text_norm:
+        pass_signals += 3
+    if "PASAPORTE" in text_norm or "PASSPORT" in text_norm:
+        pass_signals += 2
+    if "NATIONALITY" in text_norm:
+        pass_signals += 1
+    if pass_signals >= 3:
+        return "PASSPORT_MX"
 
     best = ("UNKNOWN", 0)
     for dt, prof in DOC_PROFILES.items():
@@ -582,6 +609,41 @@ def find_tag110_by_name(cur, chat_id: int, name_now: str, min_score: float = 0.8
 
     return best
 
+def find_best_110_by_name(cur, chat_id: int, name_now: str, min_score: float = 0.80, limit: int = 2500):
+    """
+    Busca SOLO personas tagueadas como 110 y compara por nombre con un umbral más tolerante.
+    Devuelve el mejor match (score, rid, created_at, name_prev, note, tagged_at) o None.
+    """
+    if not name_now:
+        return None
+
+    name_now_u = name_now
+
+    cur.execute("""
+        SELECT t.note, t.tagged_at,
+               o.id, o.created_at, o.fields_json
+        FROM person_tags t
+        JOIN ocr_texts o ON o.person_key = t.person_key AND o.chat_id = t.chat_id
+        WHERE t.chat_id=? AND CAST(t.status_code AS INTEGER)=110
+        ORDER BY o.id DESC
+        LIMIT ?
+    """, (chat_id, int(limit)))
+    rows = cur.fetchall()
+
+    best = None
+    for (note, tagged_at, rid, created_at, fields_json) in rows:
+        f = safe_json_loads(fields_json)
+        name_prev = (f.get("name") or "").strip()
+        if not name_prev:
+            continue
+
+        score = name_similarity(name_now_u, name_prev)
+        if score >= min_score:
+            if (best is None) or (score > best[0]):
+                best = (score, rid, created_at, name_prev, (note or "").strip(), tagged_at)
+
+    return best
+    
 def get_person_tag(cur, chat_id: int, person_key: str):
     if not person_key:
         return None
@@ -994,6 +1056,25 @@ def photo_received(update, context):
             m = re.search(r"\bNOMBRE\b\s+([A-Z ]{2,}\n[A-Z ]{2,}(?:\n[A-Z ]{2,}){0,2})", text_norm)
             if m:
                 name_now = " ".join([ln.strip() for ln in m.group(1).splitlines() if ln.strip()])
+                # 🚨 Prioridad: buscar 110 por nombre (aunque haya match normal con otro registro)
+        best110_alert = ""
+        if name_now:
+            connH = db_conn()
+            curH = connH.cursor()
+            best110 = find_best_110_by_name(curH, chat_id, name_now, min_score=0.80, limit=3000)
+            connH.close()
+
+            if best110:
+                score, rid110, created_at110, name_prev110, note110, tagged_at110 = best110
+                best110_alert = (
+                    "🚨🚨🚨🚨🚨🚨🚨🚨🚨\n"
+                    "🟥🟥🟥  ALERTA 110  🟥🟥🟥\n"
+                    f"👤 Posible 110 por NOMBRE ({int(score*100)}%)\n"
+                    f"🔎 Coincide con #{rid110} — {format_cdmx(created_at110)}\n"
+                    + (f"📝 {note110}\n" if note110 else "")
+                    + "🚨🚨🚨🚨🚨🚨🚨🚨🚨\n"
+                )
+
         tag_alert = ""
         person_keys_all = collect_person_keys(doc_type, fields)
         # ✅ incluir llave 110 por nombre
@@ -1146,11 +1227,11 @@ def photo_received(update, context):
                     conn.close()
 
                     if best110:
-                        score, rid, created_at, name_prev, note, tagged_at = best110
+                        score, rid110, created_at110, name_prev110, note110, tagged_at110 = best110
                         tag_alert += (
                             "\n🚨🚨 ALERTA 110 (POR NOMBRE EN HISTÓRICO) 🚨🚨\n"
-                            f"Coincidencia {int(score*100)}% con #{rid} — {format_cdmx(created_at)}\n"
-                            + (f"📝 {note}\n" if note else "")
+                            f"Coincidencia {int(score*100)}% con #{rid110} — {format_cdmx(created_at110)}\n"
+                            + (f"📝 {note110}\n" if note110 else "")
                         )
                 except Exception as e:
                     log.warning("find_tag110_by_name error: %s", e)
@@ -1180,17 +1261,17 @@ def photo_received(update, context):
             if len(shown) > 2500:
                 shown = shown[:2500] + "\n…(recortado)"
             update.message.reply_text(
-                tag_alert + name_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
+                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
                 + person_note + changes_note + fuzzy_note
             )
         elif ocr_status == "empty":
             update.message.reply_text(
-                tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
+                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
         else:
             update.message.reply_text(
-                tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
+                best110_alert + tag_alert + name_alert + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
                 + person_note + changes_note + fuzzy_note
             )
 
@@ -1378,13 +1459,13 @@ def tag(update, context):
     fields = safe_json_loads(fields_json)
 
     keys_all = collect_person_keys(doc_type, fields)
+    
+    # ✅ SIEMPRE agregar 110 por nombre (aunque haya CURP/clave/licencia/pasaporte/etc.)
+    name_now = (fields.get("name") or "").strip()
+    name110 = build_name_110_key(name_now)
+    if name110 and name110 not in keys_all:
+        keys_all.append(name110)
 
-    # Si no hay llaves fuertes, intenta guardar 110 por nombre
-    if not keys_all:
-        name_now = (fields.get("name") or "").strip()
-        name110 = build_name_110_key(name_now)
-        if name110:
-            keys_all.append(name110)
 
     if not keys_all:
         conn.close()
