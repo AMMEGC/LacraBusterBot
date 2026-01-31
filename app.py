@@ -1586,6 +1586,115 @@ def tag(update, context):
         + (f"\n📝 Nota: {note}" if note else "")
     )
 
+def quick_tag_command(update, context):
+    """
+    Tag rápido seguro por comando:
+      /110 [nota]
+      /200 [nota]
+      /300 [nota]
+
+    - Si responden (reply) a la foto: taggea ese registro.
+    - Si no responden: taggea el ÚLTIMO registro del chat.
+    """
+    msg = update.message
+    if not msg:
+        return
+
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id
+
+    # command viene sin slash: "110", "200", "300"
+    cmd = (getattr(context, "args", None) is not None and msg.text)  # solo para evitar None
+    command_name = (msg.text or "").split()[0].strip()  # ej "/110" o "/110@TuBot"
+    command_name = command_name.split("@")[0].lstrip("/")  # "110"
+
+    if command_name not in ("110", "200", "300"):
+        return
+
+    code = int(command_name)
+
+    # nota: todo lo que escriban después del comando
+    # ej: "/110 rata confirmada" -> nota "rata confirmada"
+    parts = (msg.text or "").split(maxsplit=1)
+    note = parts[1].strip() if len(parts) > 1 else ""
+
+    # 1) Si es reply a una foto, buscamos el registro por message_id del reply
+    target_message_id = None
+    if msg.reply_to_message and msg.reply_to_message.message_id:
+        target_message_id = msg.reply_to_message.message_id
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    rid = None
+    if target_message_id is not None:
+        cur.execute("""
+            SELECT id
+            FROM ocr_texts
+            WHERE chat_id=? AND message_id=?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (chat_id, int(target_message_id)))
+        r = cur.fetchone()
+        if r:
+            rid = int(r[0])
+
+    # 2) Si no hubo reply o no se encontró, usar el último registro del chat
+    if rid is None:
+        cur.execute("""
+            SELECT id
+            FROM ocr_texts
+            WHERE chat_id=?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (chat_id,))
+        r = cur.fetchone()
+        if r:
+            rid = int(r[0])
+
+    if rid is None:
+        conn.close()
+        msg.reply_text("No hay registros para taggear todavía.")
+        return
+
+    row = get_record_by_id(cur, chat_id, rid)
+    if not row:
+        conn.close()
+        msg.reply_text("No encontré ese registro.")
+        return
+
+    doc_type = row[3]
+    fields_json = row[8]
+    fields = safe_json_loads(fields_json)
+
+    keys_all = collect_person_keys(doc_type, fields)
+
+    # ✅ SIEMPRE agregar 110 por nombre si hay mínimo 2 palabras (solo cuando sea /110)
+    if code == 110:
+        name_now = (fields.get("name") or "").strip()
+        name_clean = normalize_name_for_match(name_now) if name_now else ""
+        name_parts = [p for p in name_clean.split() if p]
+        if len(name_parts) >= 2:
+            name110 = build_name_110_key(name_now)
+            if name110 and name110 not in keys_all:
+                keys_all.append(name110)
+
+    if not keys_all:
+        conn.close()
+        msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave/licencia, ni nombre).")
+        return
+
+    for k in keys_all:
+        upsert_person_tag(cur, chat_id, k, code, note, user_id)
+
+    conn.commit()
+    conn.close()
+
+    extra = " (por reply)" if target_message_id is not None else " (último registro)"
+    msg.reply_text(
+        f"✅ Tag rápido aplicado: {code} en #{rid}{extra} — {len(keys_all)} llaves."
+        + (f"\n📝 {note}" if note else "")
+    )
 
 
 def untag(update, context):
@@ -1633,6 +1742,20 @@ def untag(update, context):
 
         msg.reply_text(f"🧽 Marca eliminada en {len(keys_all)} llaves.\n🔑 Ejemplo: {keys_all[0]}")
 
+def help_cmd(update, context):
+    update.message.reply_text(
+        "📌 Comandos disponibles:\n"
+        "/start — activar bot\n"
+        "/historial [n] — últimos registros\n"
+        "/ver <id> — ver un registro\n"
+        "/persona <CURP/clave/etc> — ver historial de una persona\n"
+        "/tag <id> <codigo> [nota] — marcar por comando (admin)\n"
+        "/untag <id> — quitar marca\n"
+        "/110 [nota] — tag rápido al último registro (o al que respondas)\n\n"
+        "Tip: responde (reply) a la foto y escribe /110 para marcar esa exacta."
+    )
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN")
@@ -1651,6 +1774,8 @@ def main():
     dp.add_handler(CommandHandler("persona", persona))
     dp.add_handler(CommandHandler("tag", tag))
     dp.add_handler(CommandHandler("untag", untag))
+    dp.add_handler(CommandHandler("110", quick_tag_command))
+    dp.add_handler(CommandHandler("help", help_cmd))
 
     dp.add_handler(MessageHandler(Filters.photo, photo_received))
     dp.add_error_handler(error_handler)
