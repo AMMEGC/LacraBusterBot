@@ -1450,7 +1450,7 @@ def error_handler(update, context):
 def historial(update, context):
     msg = update.message
     if not guard_chat_enabled(update):
-    return
+        return
 
     chat_id = msg.chat_id
 
