@@ -1318,6 +1318,8 @@ def tag(update, context):
     msg = update.message
     chat_id = msg.chat_id
     user_id = msg.from_user.id
+    
+    log.info("TAG VERSION 2026-01-31 FIX ✅ (sin person_key)")
 
     if len(context.args) < 2 or not context.args[0].isdigit():
         msg.reply_text("Uso: /tag <id_registro> <codigo> [nota]\nEj: /tag 12 110 rata confirmada")
