@@ -500,6 +500,22 @@ def init_db():
             tagged_by_user_id INTEGER
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS person_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            alias_key TEXT,
+            canonical_key TEXT,
+            updated_at TEXT
+        )
+    """)
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_aliases_unique ON person_aliases(chat_id, alias_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(chat_id, canonical_key)")
+    except Exception as e:
+        log.warning("Index creation warning (person_aliases): %s", e)
+
+
 
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_tags_unique ON person_tags(chat_id, person_key)")
@@ -658,9 +674,44 @@ def get_person_tag(cur, chat_id: int, person_key: str):
     """, (chat_id, person_key))
     return cur.fetchone()
 
+def upsert_person_alias(cur, chat_id: int, alias_key: str, canonical_key: str):
+    if not alias_key or not canonical_key:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        INSERT INTO person_aliases (chat_id, alias_key, canonical_key, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id, alias_key)
+        DO UPDATE SET
+            canonical_key=excluded.canonical_key,
+            updated_at=excluded.updated_at
+    """, (chat_id, alias_key, canonical_key, now_iso))
+
+def resolve_alias(cur, chat_id: int, alias_key: str):
+    if not alias_key:
+        return None
+    cur.execute("""
+        SELECT canonical_key
+        FROM person_aliases
+        WHERE chat_id=? AND alias_key=?
+        LIMIT 1
+    """, (chat_id, alias_key))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 def delete_person_tag(cur, chat_id: int, person_key: str):
     cur.execute("DELETE FROM person_tags WHERE chat_id=? AND person_key=?", (chat_id, person_key))
+
+def delete_person_tags_for_keys(cur, chat_id: int, keys: list[str]):
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        return
+    # Borrado en lote con IN (...)
+    placeholders = ",".join(["?"] * len(keys))
+    cur.execute(
+        f"DELETE FROM person_tags WHERE chat_id=? AND person_key IN ({placeholders})",
+        [chat_id, *keys]
+    )
 
 def find_first_by_person(cur, chat_id: int, person_key: str):
     if not person_key:
@@ -1032,18 +1083,59 @@ def photo_received(update, context):
                 if m4:
                     fields["dob"] = m4.group(0)
 
-        # person key (ID fuerte por perfil)
-        person_key, person_key_type = build_person_key(doc_type, fields)
-        if not person_key:
-            nk = build_name_key(fields)
-            if nk:
-                person_key = nk
-                person_key_type = f"{doc_type}:NAMEONLY"
+                # person key (ID fuerte por perfil)
+                person_key, person_key_type = build_person_key(doc_type, fields)
+
+                name_now = (fields.get("name") or "").strip()
+                name110 = ""
+                if name_now:
+                    name_clean = normalize_name_for_match(name_now)
+                    name_parts = [p for p in name_clean.split() if p]
+                    if len(name_parts) >= 2:
+                        name110 = build_name_110_key(name_now)
+
+                # Si no hay person_key fuerte, intenta resolver por alias NAME110 -> canonical_key
+                if not person_key and name110:
+                    connA = db_conn()
+                    curA = connA.cursor()
+                    canonical = resolve_alias(curA, chat_id, name110)
+                    connA.close()
+                    if canonical:
+                        person_key = canonical
+                        person_key_type = f"{doc_type}:ALIAS_NAME110"
+
+                # Último recurso: hash por nombre
+                if not person_key:
+                    nk = build_name_key(fields)
+                    if nk:
+                        person_key = nk
+                        person_key_type = f"{doc_type}:NAMEONLY"
+
         
         created_at_iso = datetime.now(timezone.utc).isoformat()
 
         conn = db_conn()
         cur = conn.cursor()
+
+                # Guardar alias NAME110 -> canonical cuando exista una llave fuerte (CURP/RFC/CLAVE/etc.)
+        # Esto ayuda a que licencias (solo nombre) se unan con INE (CURP) en el futuro.
+        if name110:
+            # define canonical: la mejor llave disponible del registro
+            keys_all_now = collect_person_keys(doc_type, fields)
+            canonical = ""
+            for cand in keys_all_now:
+                # preferimos llaves "fuertes" (no hashes de nombre)
+                if cand.startswith("NAMEONLY:") or cand.startswith("NAME110:"):
+                    continue
+                canonical = cand
+                break
+
+            # si no encontramos fuerte, al menos usa person_key actual (si existe)
+            if not canonical and person_key and not str(person_key).startswith("NAMEONLY:"):
+                canonical = person_key
+
+            if canonical:
+                upsert_person_alias(cur, chat_id, name110, canonical)
 
         exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
 
@@ -1515,17 +1607,31 @@ def untag(update, context):
         msg.reply_text("No encontré ese ID en este chat.")
         return
 
-    person_key = row[-2]
-    if not person_key:
+        doc_type = row[3]
+        fields_json = row[8]
+        fields = safe_json_loads(fields_json)
+
+        keys_all = collect_person_keys(doc_type, fields)
+
+        # También borrar el NAME110 si aplica
+        name_now = (fields.get("name") or "").strip()
+        name_clean = normalize_name_for_match(name_now) if name_now else ""
+        name_parts = [p for p in name_clean.split() if p]
+        if len(name_parts) >= 2:
+            name110 = build_name_110_key(name_now)
+            if name110 and name110 not in keys_all:
+                keys_all.append(name110)
+
+        if not keys_all:
+            conn.close()
+            msg.reply_text("Ese registro no tiene llaves suficientes para desmarcar (ni CURP/RFC/clave/licencia, ni nombre).")
+            return
+
+        delete_person_tags_for_keys(cur, chat_id, keys_all)
+        conn.commit()
         conn.close()
-        msg.reply_text("Ese registro no tiene person_key.")
-        return
 
-    delete_person_tag(cur, chat_id, person_key)
-    conn.commit()
-    conn.close()
-
-    msg.reply_text(f"🧽 Marca eliminada.\n🔑 person_key: {person_key}")
+        msg.reply_text(f"🧽 Marca eliminada en {len(keys_all)} llaves.\n🔑 Ejemplo: {keys_all[0]}")
 
 def main():
     if not BOT_TOKEN:
