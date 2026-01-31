@@ -120,6 +120,12 @@ def normalize_name_for_match(name: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def build_name_110_key(name: str) -> str:
+    n = normalize_name_for_match(name)
+    if not n:
+        return ""
+    return "NAME110:" + sha256_hex(n)[:24]
+
 def name_tokens(name: str) -> list[str]:
     s = normalize_name_for_match(name)
     if not s:
@@ -749,8 +755,9 @@ def find_name_matches_with_tags(cur, chat_id: int, name_now: str, threshold: flo
 
             if tag:
                 status_code, note, tagged_at, tagged_by = tag
-                if int(status_code) == 110 and best_110 is None:
-                    best_110 = (score, rid, created_at, name_prev, note, tagged_at)
+                if int(status_code) == 110:
+                    if (best_110 is None) or (score > best_110[0]):
+                        best_110 = (score, rid, created_at, name_prev, note, tagged_at)
 
     matches.sort(reverse=True, key=lambda x: x[0])
     return matches[:3], best_110
@@ -939,8 +946,32 @@ def photo_received(update, context):
             if nk:
                 person_key = nk
                 person_key_type = f"{doc_type}:NAMEONLY"
+        
+        created_at_iso = datetime.now(timezone.utc).isoformat()
+
+        conn = db_conn()
+        cur = conn.cursor()
+
+        exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
+
+        first_person = None
+        latest_person = None
+        if person_key:
+            first_person = find_first_by_person(cur, chat_id, person_key)
+            latest_person = find_latest_by_person(cur, chat_id, person_key)
+
+        name_now = (fields.get("name") or "").strip()
+        # Fallback: si no se extrajo nombre por fields, intenta sacarlo del OCR completo
+        if not name_now:
+            m = re.search(r"\bNOMBRE\b\s+([A-Z ]{2,}\n[A-Z ]{2,}(?:\n[A-Z ]{2,}){0,2})", text_norm)
+            if m:
+                name_now = " ".join([ln.strip() for ln in m.group(1).splitlines() if ln.strip()])
         tag_alert = ""
         person_keys_all = collect_person_keys(doc_type, fields)
+        # ✅ incluir llave 110 por nombre
+        name110 = build_name_110_key(name_now)
+        if name110:
+            person_keys_all.append(name110)
 
         if person_keys_all:
             connT = db_conn()
@@ -971,25 +1002,6 @@ def photo_received(update, context):
                     + (f"📝 {note}\n" if note else "")
                 )
 
-        created_at_iso = datetime.now(timezone.utc).isoformat()
-
-        conn = db_conn()
-        cur = conn.cursor()
-
-        exact = find_exact_duplicate(cur, chat_id, text_hash, img_hash)
-
-        first_person = None
-        latest_person = None
-        if person_key:
-            first_person = find_first_by_person(cur, chat_id, person_key)
-            latest_person = find_latest_by_person(cur, chat_id, person_key)
-
-        name_now = (fields.get("name") or "").strip()
-        # Fallback: si no se extrajo nombre por fields, intenta sacarlo del OCR completo
-        if not name_now:
-            m = re.search(r"\bNOMBRE\b\s+([A-Z ]{2,}\n[A-Z ]{2,}(?:\n[A-Z ]{2,}){0,2})", text_norm)
-            if m:
-                name_now = " ".join([ln.strip() for ln in m.group(1).splitlines() if ln.strip()])
 
         # 🔎 Match automático por nombre (histórico completo)
         name_alert = ""
@@ -1338,6 +1350,12 @@ def tag(update, context):
 
     keys_all = collect_person_keys(doc_type, fields)
     if not keys_all:
+        # ✅ también guardar 110 por nombre (para que no dependa de CURP/clave)
+        name_now = (fields.get("name") or "").strip()
+        name110 = build_name_110_key(name_now)
+        if name110:
+            
+    keys_all.append(name110)
         conn.close()
         msg.reply_text("Ese registro no tiene identificadores suficientes (ni CURP/RFC/clave, ni nombre).")
         return
