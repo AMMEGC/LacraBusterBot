@@ -451,6 +451,8 @@ def extract_by_profile(text_norm: str, doc_type: str) -> dict:
                 # elige si es mejor que lo que había
                 if len(cand.split()) >= 3:
                     out["name"] = cand.title() if cand.isupper() else cand
+    return out
+
 
 def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
     prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
@@ -1275,6 +1277,9 @@ def photo_received(update, context):
         # ✅ Inicializar SIEMPRE (evita UnboundLocalError)
         person_key = ""
         person_key_type = ""
+        # ✅ Construir person_key para CUALQUIER documento (INE / LICENCIA / PASAPORTE)
+        person_key, person_key_type = build_person_key(doc_type, fields)
+
 
         # Ensure INE pulls curp/clave/name better
         if doc_type == "INE_MX":
@@ -1831,11 +1836,23 @@ def tag(update, context):
 
     name_clean = normalize_name_for_match(name_now) if name_now else ""
     name_parts = [p for p in name_clean.split() if p]
+    name110 = ""
 
     if len(name_parts) >= 2:
         name110 = build_name_110_key(name_now)
         if name110 and name110 not in keys_all:
             keys_all.append(name110)
+
+    # ✅ Guardar alias NAME110 -> canonical (la mejor llave fuerte disponible)
+    if code == 110 and name110:
+        canonical = ""
+        for cand in keys_all:
+            if str(cand).startswith("NAMEONLY:") or str(cand).startswith("NAME110:"):
+                continue
+            canonical = cand
+            break
+        if canonical:
+            upsert_person_alias(cur, chat_id, name110, canonical)
 
     if not keys_all:
         conn.close()
@@ -1941,6 +1958,7 @@ def quick_tag_command(update, context):
 
     # ✅ SIEMPRE agregar 110 por nombre si hay mínimo 2 palabras (solo cuando sea /110)
     if code == 110:
+        name110 = ""
         name_now = (fields.get("name") or "").strip()
         name_clean = normalize_name_for_match(name_now) if name_now else ""
         name_parts = [p for p in name_clean.split() if p]
@@ -1948,6 +1966,18 @@ def quick_tag_command(update, context):
             name110 = build_name_110_key(name_now)
             if name110 and name110 not in keys_all:
                 keys_all.append(name110)
+
+    # ✅ Guardar alias NAME110 -> canonical cuando es /110
+    if code == 110 and name110:
+        canonical = ""
+        for cand in keys_all:
+            if str(cand).startswith("NAMEONLY:") or str(cand).startswith("NAME110:"):
+                continue
+            canonical = cand
+            break
+        if canonical:
+            upsert_person_alias(cur, chat_id, name110, canonical)
+
 
     if not keys_all:
         conn.close()
