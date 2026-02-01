@@ -1044,6 +1044,73 @@ def pretty_label(k: str) -> str:
     }
     return m.get(k, k)
 
+
+def format_field_value(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return "(no detectado)"
+    # compacta saltos de línea, pero conserva bloques cortos
+    v = "\n".join([ln.strip() for ln in v.splitlines() if ln.strip()])
+    return v
+
+def build_structured_summary(doc_type: str, fields: dict) -> str:
+    # orden por tipo
+    orders = {
+        "INE_MX": ["name", "dob", "curp", "clave_elector", "domicilio", "seccion", "vigencia", "sexo", "ano_registro", "rfc"],
+        "LICENSE_MX": ["name", "dob", "curp", "license_no", "expiry"],
+        "PASSPORT_MX": ["name", "dob", "passport_no", "nationality", "sex", "expiry", "curp", "rfc"],
+        "UNKNOWN": ["name", "dob", "curp", "clave_elector", "passport_no", "license_no", "domicilio"],
+    }
+    wanted = orders.get(doc_type, orders["UNKNOWN"])
+
+    # Título bonito
+    title = {
+        "INE_MX": "🪪 INE / Credencial para votar",
+        "LICENSE_MX": "🚘 Licencia de conducir",
+        "PASSPORT_MX": "🛂 Pasaporte",
+        "UNKNOWN": "📄 Documento",
+    }.get(doc_type, "📄 Documento")
+
+    # Resumen (lo más importante arriba)
+    name = format_field_value(fields.get("name", ""))
+    dob = format_field_value(fields.get("dob", ""))
+    curp = format_field_value(fields.get("curp", ""))
+    clave = format_field_value(fields.get("clave_elector", ""))
+    passport_no = format_field_value(fields.get("passport_no", ""))
+    license_no = format_field_value(fields.get("license_no", ""))
+
+    # arma “ID principal” según doc
+    if doc_type == "INE_MX":
+        main_id = f"CURP: {curp}\nCLAVE ELECTOR: {clave}"
+    elif doc_type == "PASSPORT_MX":
+        main_id = f"PASAPORTE: {passport_no}"
+    elif doc_type == "LICENSE_MX":
+        main_id = f"LICENCIA: {license_no}\nCURP: {curp}"
+    else:
+        main_id = f"CURP: {curp}\nPASAPORTE: {passport_no}\nLICENCIA: {license_no}"
+
+    # Campos detectados (solo los que existan)
+    lines = []
+    lines.append(f"{title}")
+    lines.append("")
+    lines.append("✅ RESUMEN")
+    lines.append(f"👤 Nombre: {name}")
+    lines.append(f"🎂 Nacimiento: {dob}")
+    lines.append(main_id)
+
+    # bloque de campos
+    lines.append("")
+    lines.append("📌 CAMPOS DETECTADOS")
+    for k in wanted:
+        if k not in fields:
+            continue
+        v = format_field_value(fields.get(k, ""))
+        if not v or v == "(no detectado)":
+            continue
+        lines.append(f"{pretty_label(k)}: {v}")
+
+    return "\n".join(lines).strip()
+
 # =========================
 # Telegram handlers
 # =========================
@@ -1439,23 +1506,32 @@ def photo_received(update, context):
             person_key_type=person_key_type,
         )
 
-        # Reply
-        if ocr_status == "ok" and ocr_text.strip():
-            shown = ocr_text.strip()
-            if len(shown) > 2500:
-                shown = shown[:2500] + "\n…(recortado)"
+        # Reply (formato bonito)
+        pretty = build_structured_summary(doc_type, fields)
 
+        debug_ocr = ""
+        if ocr_text and ocr_text.strip():
+            shown = ocr_text.strip()
+            if len(shown) > 1200:
+                shown = shown[:1200] + "\n…(recortado)"
+            debug_ocr = "\n\n🧠 OCR (debug)\n" + shown
+
+        if ocr_status == "ok" and ocr_text.strip():
             msg.reply_text(
                 best110_alert + tag_alert + name_alert
-                + f"🆔 Registro #{rid}\n📄 Texto detectado y guardado ({doc_type}).\n\n{shown}"
-                + person_note + changes_note + fuzzy_note,
+                + f"🆔 Registro #{rid}\n\n"
+                + pretty
+                + person_note + changes_note + fuzzy_note
+                + debug_ocr,
                 parse_mode=None
             )
 
         elif ocr_status == "empty":
             msg.reply_text(
                 best110_alert + tag_alert + name_alert
-                + f"🆔 Registro #{rid}\n📸 Foto guardada (sin texto legible) ({doc_type})."
+                + f"🆔 Registro #{rid}\n\n"
+                + pretty
+                + "\n\n📸 Foto guardada (sin texto legible)."
                 + person_note + changes_note + fuzzy_note,
                 parse_mode=None
             )
@@ -1463,10 +1539,13 @@ def photo_received(update, context):
         else:
             msg.reply_text(
                 best110_alert + tag_alert + name_alert
-                + f"🆔 Registro #{rid}\n📸 Foto guardada, pero el OCR falló ({doc_type})."
+                + f"🆔 Registro #{rid}\n\n"
+                + pretty
+                + "\n\n📸 Foto guardada, pero el OCR falló."
                 + person_note + changes_note + fuzzy_note,
                 parse_mode=None
             )
+
             
     except Exception as e:
         log.exception("photo_received crashed: %s", e)
