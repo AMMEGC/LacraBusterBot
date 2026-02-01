@@ -126,10 +126,16 @@ def normalize_name_for_match(name: str) -> str:
     return s
 
 def build_name_110_key(name: str) -> str:
-    n = normalize_name_for_match(name)
-    if not n:
+    """
+    Llave 110 por nombre, INSENSIBLE AL ORDEN:
+    - "JUAN PEREZ LOPEZ" y "PEREZ LOPEZ JUAN" dan la misma llave
+    - tolera espacios/saltos/acentos
+    """
+    toks = name_tokens(name)  # ya normaliza, quita acentos y stopwords
+    if len(toks) < 2:
         return ""
-    return "NAME110:" + sha256_hex(n)[:24]
+    canonical = " ".join(sorted(toks))
+    return "NAME110:" + sha256_hex(canonical)[:24]
 
 def name_tokens(name: str) -> list[str]:
     s = normalize_name_for_match(name)
@@ -393,13 +399,11 @@ def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
 
 def build_name_key(fields: dict) -> str:
     name = (fields.get("name") or "").strip()
-    if not name:
+    toks = name_tokens(name)
+    if len(toks) < 2:
         return ""
-    # Normaliza igual que tu OCR (mayúsculas, sin acentos, espacios)
-    name_norm = normalize_text_for_hash(name).replace("\n", " ").strip()
-    if not name_norm:
-        return ""
-    return "NAMEONLY:" + sha256_hex(name_norm)[:24]
+    canonical = " ".join(sorted(toks))
+    return "NAMEONLY:" + sha256_hex(canonical)[:24]
 
 def collect_person_keys(doc_type: str, fields: dict) -> list[str]:
     """
