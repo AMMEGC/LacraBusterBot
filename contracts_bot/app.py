@@ -509,6 +509,124 @@ def collect_person_keys(doc_type: str, fields: dict) -> list[str]:
     return out
 
 # =========================
+# Contract extraction
+# =========================
+
+# Detecta "paquete/seguro" (ajústalo luego con palabras exactas de tus contratos)
+_PACKAGE_FULL_RE = re.compile(r"\b(FULL\s*(COVER|COVERAGE)?|ZERO\s*DEDUCTIBLE|0%\s*DEDUCTIBLE|SIN\s*DEDUCIBLE)\b", re.I)
+_PACKAGE_BASIC_RE = re.compile(r"\b(BASIC|BASICO|BÁSICO|STANDARD|LIMITED\s*PROTECTION)\b", re.I)
+_PACKAGE_NONE_RE = re.compile(r"\b(NO\s*INSURANCE|SIN\s*SEGURO|DECLINED|RECHAZA\s*SEGURO)\b", re.I)
+
+# Numero de contrato: heurísticas comunes
+_CONTRACT_NO_RE_LIST = [
+    re.compile(r"\b(CONTRACT|CONTRATO)\s*(NO|#|NUM|NUMBER|NÚM|NUMERO|NÚMERO)?\s*[:#]?\s*([A-Z0-9\-]{5,20})\b", re.I),
+    re.compile(r"\b(RESERVATION|RESERVA)\s*(NO|#|NUM|NUMBER)?\s*[:#]?\s*([A-Z0-9\-]{5,20})\b", re.I),
+    # fallback: "RA123456" o similar (si aplica a tu formato, si no, lo quitamos después)
+]
+
+# Fechas: buscamos etiquetas cerca para evitar agarrar DOB o cualquier otra
+_OPEN_LABEL_RE = re.compile(r"\b(OPEN\s*DATE|DATE\s*OPENED|FECHA\s*DE\s*APERTURA|APERTURA)\b", re.I)
+_CLOSE_LABEL_RE = re.compile(r"\b(CLOSE\s*DATE|DATE\s*CLOSED|FECHA\s*DE\s*CIERRE|CIERRE|RETURN\s*DATE|DUE\s*BACK)\b", re.I)
+
+# Formatos de fecha frecuentes en OCR:
+_DATE_RE = re.compile(
+    r"\b(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4}|\d{2}\s+[A-Z]{3}\s+\d{4})\b",
+    re.I
+)
+
+def _parse_date_to_iso(date_str: str) -> str:
+    """
+    Convierte fechas OCR típicas a 'YYYY-MM-DD' si se puede.
+    Soporta:
+      - YYYY-MM-DD / YYYY/MM/DD
+      - DD/MM/YYYY / DD-MM-YYYY
+      - '02 FEB 2026' (EN)
+    Si no puede, regresa ''.
+    """
+    s = (date_str or "").strip().upper().replace(".", "")
+    s = re.sub(r"\s+", " ", s)
+
+    # YYYY-MM-DD
+    m = re.fullmatch(r"(\d{4})[-/](\d{2})[-/](\d{2})", s)
+    if m:
+        y, mo, d = m.group(1), m.group(2), m.group(3)
+        return f"{y}-{mo}-{d}"
+
+    # DD/MM/YYYY
+    m = re.fullmatch(r"(\d{2})[-/](\d{2})[-/](\d{4})", s)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3)
+        return f"{y}-{mo}-{d}"
+
+    # '02 FEB 2026'
+    m = re.fullmatch(r"(\d{2})\s+([A-Z]{3})\s+(\d{4})", s)
+    if m:
+        d = m.group(1)
+        mon = m.group(2)
+        y = m.group(3)
+        months = {
+            "JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
+            "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"
+        }
+        mo = months.get(mon)
+        if mo:
+            return f"{y}-{mo}-{d}"
+
+    return ""
+
+def _find_date_near_label(text: str, label_re: re.Pattern, window: int = 180) -> str:
+    """
+    Busca una fecha dentro de una ventana después de una etiqueta.
+    Retorna ISO YYYY-MM-DD o ''.
+    """
+    m = label_re.search(text)
+    if not m:
+        return ""
+    start = m.start()
+    chunk = text[start:start + window]
+    dm = _DATE_RE.search(chunk)
+    if not dm:
+        return ""
+    return _parse_date_to_iso(dm.group(0))
+
+def extract_contract_fields(text_norm: str) -> dict:
+    """
+    Regresa SOLO:
+      contract_number, open_date, close_date, package
+    """
+    t = text_norm or ""
+    out = {
+        "contract_number": "",
+        "open_date": "",
+        "close_date": "",
+        "package": "UNKNOWN",
+    }
+
+    # Contract number
+    for rx in _CONTRACT_NO_RE_LIST:
+        m = rx.search(t)
+        if m:
+            out["contract_number"] = (m.group(m.lastindex) or "").strip()
+            break
+
+    # Open date
+    out["open_date"] = _find_date_near_label(t, _OPEN_LABEL_RE, window=220)
+
+    # Close date (la más importante)
+    out["close_date"] = _find_date_near_label(t, _CLOSE_LABEL_RE, window=260)
+
+    # Package
+    if _PACKAGE_FULL_RE.search(t):
+        out["package"] = "FULL"
+    elif _PACKAGE_NONE_RE.search(t):
+        out["package"] = "SIN_SEGURO"
+    elif _PACKAGE_BASIC_RE.search(t):
+        out["package"] = "BASICO"
+    else:
+        out["package"] = "UNKNOWN"
+
+    return out
+# =========================
 # OCR.space
 # =========================
 def ocr_space_bytes(jpeg_bytes: bytes) -> str:
@@ -597,6 +715,49 @@ def init_db():
             updated_at TEXT
         )
     """)
+    # =========================
+    # Contracts tables
+    # =========================
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            user_id INTEGER,
+            message_id INTEGER,
+            created_at TEXT,
+
+            contract_number TEXT,
+            open_date TEXT,   -- ISO: YYYY-MM-DD (si se logra)
+            close_date TEXT,  -- ISO: YYYY-MM-DD (si se logra)
+            package TEXT,     -- FULL | BASICO | SIN_SEGURO | UNKNOWN
+
+            ocr_text TEXT,    -- opcional (debug). si luego lo quieres quitar, se puede
+            text_norm TEXT,
+            text_hash TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contract_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            contract_id INTEGER,
+            tag TEXT,
+            note TEXT,
+            tagged_at TEXT,
+            tagged_by_user_id INTEGER
+        )
+    """)
+
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contracts_chat_created ON contracts(chat_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contracts_contract_number ON contracts(chat_id, contract_number)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contracts_close_date ON contracts(chat_id, close_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contracts_text_hash ON contracts(chat_id, text_hash)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contract_tags_contract ON contract_tags(chat_id, contract_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_contract_tags_tag ON contract_tags(chat_id, tag)")
+    except Exception as e:
+        log.warning("Index creation warning (contracts): %s", e)
     try:
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_person_aliases_unique ON person_aliases(chat_id, alias_key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_person_aliases_canonical ON person_aliases(chat_id, canonical_key)")
@@ -637,6 +798,140 @@ def init_db():
 
 def db_conn():
     return sqlite3.connect(DBPATH)
+
+# =========================
+# Contracts DB helpers
+# =========================
+def insert_contract(
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    created_at_iso: str,
+    contract_number: str,
+    open_date: str,
+    close_date: str,
+    package: str,
+    ocr_text: str,
+    text_norm: str,
+    text_hash: str,
+) -> int:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO contracts (
+            chat_id, user_id, message_id, created_at,
+            contract_number, open_date, close_date, package,
+            ocr_text, text_norm, text_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        int(chat_id), int(user_id), int(message_id), created_at_iso,
+        (contract_number or "").strip(),
+        (open_date or "").strip(),
+        (close_date or "").strip(),
+        (package or "UNKNOWN").strip(),
+        (ocr_text or "").strip(),
+        (text_norm or "").strip(),
+        (text_hash or "").strip(),
+    ))
+    rid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return int(rid)
+
+def month_key_cdmx(dt: datetime) -> str:
+    # YYYY-MM
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+def _today_cdmx_date_iso() -> str:
+    # YYYY-MM-DD en CDMX
+    now = datetime.now(TZ_CDMX)
+    return f"{now.year:04d}-{now.month:02d}-{now.day:02d}"
+
+def get_contract_stats_for_month(cur, chat_id: int, ym: str) -> dict:
+    """
+    ym = 'YYYY-MM'
+    open = close_date >= hoy (o vacía)
+    closed = close_date < hoy (si existe)
+    """
+    ym = (ym or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}", ym):
+        ym = month_key_cdmx(datetime.now(TZ_CDMX))
+
+    start = ym + "-01"
+    # fin aproximado por LIKE (suficiente para SQLite y sencillo)
+    today_iso = _today_cdmx_date_iso()
+
+    # total en mes por created_at
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM contracts
+        WHERE chat_id=? AND substr(created_at,1,7)=?
+    """, (int(chat_id), ym))
+    total = int(cur.fetchone()[0] or 0)
+
+    # abiertos: close_date vacío o >= hoy
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM contracts
+        WHERE chat_id=? AND substr(created_at,1,7)=?
+          AND (close_date IS NULL OR close_date='' OR close_date >= ?)
+    """, (int(chat_id), ym, today_iso))
+    opened = int(cur.fetchone()[0] or 0)
+
+    # cerrados: close_date < hoy
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM contracts
+        WHERE chat_id=? AND substr(created_at,1,7)=?
+          AND close_date <> '' AND close_date < ?
+    """, (int(chat_id), ym, today_iso))
+    closed = int(cur.fetchone()[0] or 0)
+
+    # cierran en el mes (por close_date)
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM contracts
+        WHERE chat_id=? AND substr(close_date,1,7)=?
+    """, (int(chat_id), ym))
+    closing_in_month = int(cur.fetchone()[0] or 0)
+
+    return {
+        "ym": ym,
+        "total": total,
+        "open": opened,
+        "closed": closed,
+        "closing_in_month": closing_in_month,
+        "today": today_iso,
+    }
+
+def list_contracts_closing_soon(cur, chat_id: int, days: int = 3, limit: int = 30):
+    """
+    close_date entre hoy y hoy+days (inclusive)
+    """
+    if days < 0:
+        days = 0
+    if days > 60:
+        days = 60
+
+    today = datetime.now(TZ_CDMX).date()
+    end = (today.toordinal() + int(days))
+    end_date = datetime.fromordinal(end).date()
+    today_iso = today.isoformat()
+    end_iso = end_date.isoformat()
+
+    cur.execute("""
+        SELECT id, contract_number, open_date, close_date, package, created_at
+        FROM contracts
+        WHERE chat_id=?
+          AND close_date <> ''
+          AND close_date >= ?
+          AND close_date <= ?
+        ORDER BY close_date ASC
+        LIMIT ?
+    """, (int(chat_id), today_iso, end_iso, int(limit)))
+    return cur.fetchall()
+
 
 # =========================
 # DB queries
@@ -1271,70 +1566,45 @@ def photo_received(update, context):
         text_norm = normalize_text_for_hash(ocr_text)
         text_hash = sha256_hex(text_norm) if text_norm else ""
 
-        # Doc type + fields
-        doc_type = detect_doc_type(text_norm)
-        fields = extract_by_profile(text_norm, doc_type)
-        # ✅ Inicializar SIEMPRE (evita UnboundLocalError)
-        person_key = ""
-        person_key_type = ""
-        # ✅ Construir person_key para CUALQUIER documento (INE / LICENCIA / PASAPORTE)
-        person_key, person_key_type = build_person_key(doc_type, fields)
+        # =========================
+        # Contracts: extract only what we need
+        # =========================
+        contract = extract_contract_fields(text_norm)
 
-
-        # Ensure INE pulls curp/clave/name better
-        if doc_type == "INE_MX":
-            if "name" not in fields:
-                fields["name"] = extract_name_block_ine(text_norm)
-            if "curp" not in fields:
-                m = CURP_RE.search(text_norm)
-                if m:
-                    fields["curp"] = m.group(0)
-            if "clave_elector" not in fields:
-                if "CLAVE DE ELECTOR" in text_norm:
-                    idx = text_norm.find("CLAVE DE ELECTOR")
-                    window = text_norm[idx: idx + 350]
-                    m2 = CLAVE_ELECTOR_RE.search(window)
-                    if m2:
-                        fields["clave_elector"] = m2.group(0)
-                if "clave_elector" not in fields:
-                    m3 = CLAVE_ELECTOR_RE.search(text_norm)
-                    if m3:
-                        fields["clave_elector"] = m3.group(0)
-            if "dob" not in fields:
-                m4 = DOB_RE.search(text_norm)
-                if m4:
-                    fields["dob"] = m4.group(0)
-
-                # person key (ID fuerte por perfil)
-                person_key, person_key_type = build_person_key(doc_type, fields)
-
-                name_now = (fields.get("name") or "").strip()
-                name110 = ""
-                if name_now:
-                    name_clean = normalize_name_for_match(name_now)
-                    name_parts = [p for p in name_clean.split() if p]
-                    if len(name_parts) >= 2:
-                        name110 = build_name_110_key(name_now)
-
-                # Si no hay person_key fuerte, intenta resolver por alias NAME110 -> canonical_key
-                if not person_key and name110:
-                    connA = db_conn()
-                    curA = connA.cursor()
-                    canonical = resolve_alias(curA, chat_id, name110)
-                    connA.close()
-                    if canonical:
-                        person_key = canonical
-                        person_key_type = f"{doc_type}:ALIAS_NAME110"
-
-                # Último recurso: hash por nombre
-                if not person_key:
-                    nk = build_name_key(fields)
-                    if nk:
-                        person_key = nk
-                        person_key_type = f"{doc_type}:NAMEONLY"
-
-        
         created_at_iso = datetime.now(timezone.utc).isoformat()
+
+        # Insert into contracts DB
+        rid_contract = insert_contract(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=message_id,
+            created_at_iso=created_at_iso,
+            contract_number=contract.get("contract_number", ""),
+            open_date=contract.get("open_date", ""),
+            close_date=contract.get("close_date", ""),
+            package=contract.get("package", "UNKNOWN"),
+            ocr_text=ocr_text,
+            text_norm=text_norm,
+            text_hash=text_hash,
+        )
+
+        # Reply
+        cn = contract.get("contract_number") or "(no detectado)"
+        od = contract.get("open_date") or "(no detectado)"
+        cd = contract.get("close_date") or "(no detectado)"
+        pkg = contract.get("package") or "UNKNOWN"
+
+        update.message.reply_text(
+            "✅ Contrato registrado\n"
+            f"🆔 ID: #{rid_contract}\n"
+            f"📄 Contrato: {cn}\n"
+            f"📅 Apertura: {od}\n"
+            f"📅 Cierre: {cd}\n"
+            f"🛡️ Paquete: {pkg}",
+            parse_mode=None
+        )
+        return
+
 
         conn = db_conn()
         cur = conn.cursor()
@@ -2195,6 +2465,56 @@ def chatstatus(update, context):
     state = "✅ ENABLED" if int(enabled) == 1 else "⛔ BLOQUEADO"
     msg.reply_text(f"📌 Estado chat: {state}\n🏷️ Label: {label or '-'}\n🕒 Updated: {format_cdmx(updated_at)}")
 
+# =========================
+# Contract commands
+# =========================
+def cstats(update, context):
+    msg = update.message
+    if not guard_chat_enabled(update):
+        return
+
+    ym = ""
+    if context.args:
+        ym = (context.args[0] or "").strip()
+
+    conn = db_conn()
+    cur = conn.cursor()
+    st = get_contract_stats_for_month(cur, msg.chat_id, ym)
+    conn.close()
+
+    msg.reply_text(
+        f"📊 Contratos {st['ym']}\n"
+        f"🧾 Total registrados: {st['total']}\n"
+        f"🟡 Abiertos (según cierre>=hoy o sin cierre): {st['open']}\n"
+        f"🟢 Cerrados (cierre<hoy): {st['closed']}\n"
+        f"📅 Cierran en el mes: {st['closing_in_month']}\n"
+        f"📍 Hoy: {st['today']} (CDMX)"
+    )
+
+def cfollowup(update, context):
+    msg = update.message
+    if not guard_chat_enabled(update):
+        return
+
+    days = 3
+    if context.args and str(context.args[0]).isdigit():
+        days = int(context.args[0])
+
+    conn = db_conn()
+    cur = conn.cursor()
+    rows = list_contracts_closing_soon(cur, msg.chat_id, days=days, limit=30)
+    conn.close()
+
+    if not rows:
+        msg.reply_text(f"✅ No hay contratos que cierren en los próximos {days} días.")
+        return
+
+    lines = [f"⚠️ Contratos que cierran en <= {days} días:"]
+    for (cid, cn, od, cd, pkg, created_at) in rows:
+        lines.append(f"• #{cid} — {cn or '(s/n)'} — cierre {cd} — {pkg}")
+    msg.reply_text("\n".join(lines))
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Falta CONTRACTS_BOT_TOKEN")
@@ -2208,6 +2528,8 @@ def main():
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("stats", cstats))
+    dp.add_handler(CommandHandler("followup", cfollowup))
     dp.add_handler(CommandHandler("historial", historial))
     dp.add_handler(CommandHandler("ver", ver))
     dp.add_handler(CommandHandler("persona", persona))
