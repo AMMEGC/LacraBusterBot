@@ -405,18 +405,52 @@ def extract_by_profile(text_norm: str, doc_type: str) -> dict:
         val = (val or "").strip()
         if val:
             out[field] = val
-    # ✅ Parche: en LICENCIA a veces el OCR trae CURP o RFC pero el perfil no lo agarra bien
+    # ✅ Parche fuerte para LICENSE_MX: armar nombre completo aunque OCR ponga "Nombre: DIAZ" arriba
     if doc_type == "LICENSE_MX":
-        if "curp" not in out:
-            m = CURP_RE.search(text_norm)
-            if m:
-                out["curp"] = m.group(0)
+        # Normaliza para búsquedas (quita símbolos, deja espacios)
+        t = text_norm
 
-        if "rfc" not in out:
-            m = RFC_RE.search(text_norm)
-            if m:
-                out["rfc"] = m.group(0)
-    return out
+        def pick_after(lbl, span=120):
+            i = t.find(lbl)
+            if i == -1:
+                return ""
+            chunk = t[i:i+span]
+            chunk = chunk.split("\n", 1)[-1]
+            chunk = chunk.strip()
+            # primera línea útil
+            line = chunk.split("\n")[0].strip()
+            return line
+
+        ap = pick_after("APELLIDO PATERNO")
+        am = pick_after("APELLIDO MATERNO")
+        nm = pick_after("NOMBRE(S)")
+        if not nm:
+            nm = pick_after("NOMBRES")
+
+        # Si encontramos las 3 piezas, construimos nombre completo confiable
+        full = " ".join([ap, am, nm]).strip().replace("  ", " ").strip()
+        if len(full.split()) >= 3:
+            out["name"] = full
+
+        # Si no se pudo por etiquetas, intenta rescatar un "Nombre" multilínea más largo
+        if ("name" not in out) or (len(out["name"].split()) < 2):
+            # toma hasta 6 líneas después de "NOMBRE", pero filtra cosas que NO son nombre
+            stop = {"DOMICILIO", "LICENCIA", "CURP", "RFC", "SEXO", "FECHA", "NACIMIENTO", "CLAVE", "ELECTOR", "VIGENCIA", "REGISTRO"}
+            i = t.find("NOMBRE")
+            if i != -1:
+                chunk = t[i:i+250]
+                lines = [ln.strip() for ln in chunk.split("\n")[1:7] if ln.strip()]
+                words = []
+                for ln in lines:
+                    up = ln.upper()
+                    if any(s in up for s in stop):
+                        break
+                    # solo palabras tipo nombre
+                    words.extend([w for w in up.replace(",", " ").split() if w.isalpha()])
+                cand = " ".join(words).strip()
+                # elige si es mejor que lo que había
+                if len(cand.split()) >= 3:
+                    out["name"] = cand.title() if cand.isupper() else cand
 
 def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
     prof = DOC_PROFILES.get(doc_type, DOC_PROFILES["UNKNOWN"])
