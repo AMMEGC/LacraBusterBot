@@ -1388,7 +1388,8 @@ def photo_received(update, context):
         if len(name_parts) >= 2:
             connH = db_conn()
             curH = connH.cursor()
-            best110 = find_best_110_by_name(curH, chat_id, name_now, min_score=0.80, limit=3000)
+            min_sc = 0.72 if doc_type in ("LICENSE_MX", "PASSPORT_MX") else 0.80
+            best110 = find_best_110_by_name(curH, chat_id, name_now, min_score=min_sc, limit=3000)
             connH.close()
 
             if best110:
@@ -1479,9 +1480,10 @@ def photo_received(update, context):
 
         conn.close()
 
-        # If exact duplicate -> reply and do not insert
-               # If exact duplicate -> reply (pero SIEMPRE mostrar alertas y resumen)
-        # If exact duplicate -> reply (pero SIEMPRE mostrar alertas, resumen y el ID anterior)
+        # ✅ Inicialización para evitar UnboundLocalError en cualquier rama
+        person_note = ""
+        changes_note = ""
+        fuzzy_note = ""
         if exact:
             kind, row = exact
             prev_rid = row[0]          # id del registro original
