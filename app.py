@@ -1402,14 +1402,25 @@ def photo_received(update, context):
         conn.close()
 
         # If exact duplicate -> reply and do not insert
+               # If exact duplicate -> reply (pero SIEMPRE mostrar alertas y resumen)
+        # If exact duplicate -> reply (pero SIEMPRE mostrar alertas, resumen y el ID anterior)
         if exact:
             kind, row = exact
-            first_seen_iso = row[1]
+            prev_rid = row[0]          # id del registro original
+            first_seen_iso = row[1]    # created_at del original
             when = format_cdmx(first_seen_iso)
+
+            pretty = build_structured_summary(doc_type, fields)
+
             update.message.reply_text(
-                f"✅ Ya estaba registrada.\n"
-                f"🕒 Primera vez: {when}\n"
-                f"🔎 Coincidencia: {'TEXTO' if kind=='TEXT' else 'IMAGEN'}"
+                best110_alert + tag_alert + name_alert
+                + "✅ Ya estaba registrada.\n"
+                + f"🆔 Registro original: #{prev_rid}\n"
+                + f"🕒 Primera vez: {when}\n"
+                + f"🔎 Coincidencia: {'TEXTO' if kind=='TEXT' else 'IMAGEN'}\n\n"
+                + pretty
+                + person_note + changes_note + fuzzy_note,
+                parse_mode=None
             )
             return
 
