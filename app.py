@@ -1514,7 +1514,7 @@ def photo_received(update, context):
             shown = ocr_text.strip()
             if len(shown) > 1200:
                 shown = shown[:1200] + "\n…(recortado)"
-            debug_ocr = "\n\n🧠 OCR (debug)\n" + shown
+            debug_ocr = "\n\n🧾 OCR (debug)\n" + shown
 
         if ocr_status == "ok" and ocr_text.strip():
             msg.reply_text(
