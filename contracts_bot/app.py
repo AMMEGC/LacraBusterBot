@@ -21,8 +21,8 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 # =========================
 # Config
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DBPATH = os.environ.get("DBPATH", "/var/data/lacra.sqlite")
+BOT_TOKEN = os.environ.get("CONTRACTS_BOT_TOKEN")
+DBPATH = os.environ.get("CONTRACTS_DBPATH", "/var/data/contracts.sqlite")
 OCR_SPACE_API_KEY = os.environ.get("OCR_SPACE_API_KEY")
 
 ADMIN_USER_IDS = set(
@@ -2197,7 +2197,7 @@ def chatstatus(update, context):
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Falta BOT_TOKEN")
+        raise RuntimeError("Falta CONTRACTS_BOT_TOKEN")
 
     init_db()
 
