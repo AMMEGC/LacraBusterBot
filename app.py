@@ -212,27 +212,52 @@ def extract_name_block_ine(text_norm: str) -> str:
 
 def extract_name_from_license(text_norm: str) -> str:
     """
-    Licencia EdoMex/CDMX suele venir como:
+    Licencia (EdoMex/CDMX) viene como:
     APELLIDO PATERNO
-    GARCIA
+    DIAZ
     APELLIDO MATERNO
-    VALDEZ
+    JIMENEZ
     NOMBRE(S)
-    GUSTAVO
+    CARLOS MARIO
+
+    OCR a veces mete comas, puntos o pega texto; esto lo hace más robusto.
     """
     def grab_after(label: str) -> str:
-        block = extract_block_after_label(text_norm, label, max_lines=1)
+        block = extract_block_after_label(text_norm, label, max_lines=2)
         block = (block or "").strip()
-        if re.fullmatch(r"[A-Z ]{2,}", block):
-            return block
-        return ""
+
+        # Limpia basura típica del OCR
+        block = block.replace(",", " ")
+        block = re.sub(r"[^A-Z ]+", " ", block)
+        block = re.sub(r"\s+", " ", block).strip()
+
+        # Quédate con la primera línea “buena” si vinieron dos
+        # (ej: a veces mete "APELLIDO ME" etc)
+        parts = [p for p in block.split(" ") if len(p) >= 2]
+        if not parts:
+            return ""
+
+        # Regresa todo el bloque limpio
+        return " ".join(parts).strip()
 
     ap = grab_after("APELLIDO PATERNO")
     am = grab_after("APELLIDO MATERNO")
     nom = grab_after("NOMBRE(S)")
-    parts = [p for p in [ap, am, nom] if p]
-    return " ".join(parts).strip()
 
+    # Si por alguna razón NOM no salió, intenta un fallback por "NOMBRE"
+    if not nom:
+        nom2 = extract_block_after_label(text_norm, "NOMBRE", max_lines=2)
+        nom2 = (nom2 or "").strip()
+        nom2 = re.sub(r"[^A-Z ]+", " ", nom2)
+        nom2 = re.sub(r"\s+", " ", nom2).strip()
+        nom = nom2
+
+    parts = [p for p in [ap, am, nom] if p]
+    full = " ".join(parts).strip()
+
+    # Validación mínima: 2+ tokens para considerarlo nombre
+    toks = name_tokens(full)
+    return full if len(toks) >= 2 else ""
 
 # =========================
 # Document profiles
@@ -274,7 +299,7 @@ DOC_PROFILES = {
 
     "LICENSE_MX": {
         "keywords": ["LICENCIA", "CONDUCIR", "DRIVER", "VIGENCIA", "TIPO", "LICENSE"],
-        "id_fields_priority": ["license_no", "curp"],
+        "id_fields_priority": ["curp", "license_no"],
         "fields": {
             # Nombre: en licencias casi nunca viene como "NOMBRE" limpio, viene por apellidos + nombres
             "name": {"label": "NOMBRE", "max_lines": 3},  # lo dejamos por compatibilidad
@@ -380,7 +405,17 @@ def extract_by_profile(text_norm: str, doc_type: str) -> dict:
         val = (val or "").strip()
         if val:
             out[field] = val
+    # ✅ Parche: en LICENCIA a veces el OCR trae CURP o RFC pero el perfil no lo agarra bien
+    if doc_type == "LICENSE_MX":
+        if "curp" not in out:
+            m = CURP_RE.search(text_norm)
+            if m:
+                out["curp"] = m.group(0)
 
+        if "rfc" not in out:
+            m = RFC_RE.search(text_norm)
+            if m:
+                out["rfc"] = m.group(0)
     return out
 
 def build_person_key(doc_type: str, fields: dict) -> tuple[str, str]:
